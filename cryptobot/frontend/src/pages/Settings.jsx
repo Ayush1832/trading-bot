@@ -1,14 +1,14 @@
 import { useState, useEffect } from 'react'
 import api from '../hooks/useApi.js'
 
-const ALL_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+const ALL_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'LINK/USDT', 'MATIC/USDT', 'DOGE/USDT', 'ADA/USDT']
 
 export default function Settings() {
   const [form, setForm] = useState({
     bybit_api_key: '',
     bybit_api_secret: '',
-    symbol: 'BTC/USDT',
-    symbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
+    symbol: 'ETH/USDT',
+    symbols: ['ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'LINK/USDT'],
     trade_usdt: 1.0,
     // Swing — R:R and TSL
     min_rr_ratio: 3.0,
@@ -50,7 +50,7 @@ export default function Settings() {
       if (current.length <= 1) return
       update('symbols', current.filter((s) => s !== sym))
     } else {
-      if (current.length >= 3) return
+      if (current.length >= 6) return
       update('symbols', [...current, sym])
     }
   }
@@ -95,11 +95,11 @@ export default function Settings() {
         </Field>
       </Section>
 
-      <Section title="Watchlist (BTC · ETH · SOL)">
+      <Section title="Watchlist — select up to 6 pairs">
         <p className="text-xs text-gray-500 mb-3">
-          Selected: {currentSymbols.join(', ')} — swing strategy needs deep liquidity.
+          Selected: {currentSymbols.join(', ')} — more symbols = more signal opportunities.
         </p>
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-4 gap-2">
           {ALL_SYMBOLS.map((sym) => {
             const selected = currentSymbols.includes(sym)
             return (

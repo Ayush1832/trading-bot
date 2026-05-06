@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Multi-symbol watchlist (BTC/ETH/SOL only — swing needs deep liquidity)
     # ------------------------------------------------------------------ #
-    symbols: List[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    symbol: str = "BTC/USDT"       # primary display symbol
+    symbols: List[str] = ["ETH/USDT", "SOL/USDT", "AVAX/USDT", "LINK/USDT"]
+    symbol: str = "ETH/USDT"       # primary display symbol
 
     # ------------------------------------------------------------------ #
     # Timeframes
