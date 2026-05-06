@@ -10,6 +10,8 @@ export function useWebSocket() {
   const setCandles = useStore((s) => s.setCandles)
   const setTslPulse = useStore((s) => s.setTslPulse)
 
+  const setScanner = useStore((s) => s.setScanner)
+
   useEffect(() => {
     let reconnectTimer = null
 
@@ -34,21 +36,27 @@ export function useWebSocket() {
               setTslPulse(true)
               setTimeout(() => setTslPulse(false), 2000)
               break
+            case 'scanner_update':
+              setScanner(msg.data)
+              break
           }
         } catch {}
       }
 
-      ws.onclose = () => {
-        reconnectTimer = setTimeout(connect, 3000)
+      let pingInterval = null
+
+      ws.onopen = () => {
+        pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }))
+          }
+        }, 30000)
       }
 
-      const pingInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'ping' }))
-        }
-      }, 30000)
-
-      ws.onopen = () => clearInterval(pingInterval)
+      ws.onclose = () => {
+        if (pingInterval) clearInterval(pingInterval)
+        reconnectTimer = setTimeout(connect, 3000)
+      }
     }
 
     connect()

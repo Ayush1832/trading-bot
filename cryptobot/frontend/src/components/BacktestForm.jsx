@@ -4,12 +4,12 @@ import api from '../hooks/useApi.js'
 export default function BacktestForm({ onResult }) {
   const [form, setForm] = useState({
     symbol: 'BTC/USDT',
-    start_date: '2024-01-01',
-    end_date: '2024-03-31',
-    trail_pct: 0.8,
-    take_profit_pct: 1.2,
-    hard_sl_pct: 0.8,
-    max_hold_minutes: 30,
+    start_date: '2023-01-01',
+    end_date: '2024-01-01',
+    min_rr_ratio: 3.0,
+    atr_1h_multiplier: 1.5,
+    max_hold_hours: 72,
+    daily_pullback_tolerance: 1.5,
   })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -22,10 +22,7 @@ export default function BacktestForm({ onResult }) {
     try {
       const payload = {
         ...form,
-        trail_pct: form.trail_pct / 100,
-        take_profit_pct: form.take_profit_pct / 100,
-        hard_sl_pct: form.hard_sl_pct / 100,
-        timeframe: '1m',
+        daily_pullback_tolerance: form.daily_pullback_tolerance / 100,
       }
       const r = await api.post('/backtest', payload)
       onResult(r.data)
@@ -38,7 +35,10 @@ export default function BacktestForm({ onResult }) {
 
   return (
     <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-      <h3 className="text-sm font-semibold text-gray-300 mb-4">Backtest Parameters</h3>
+      <h3 className="text-sm font-semibold text-gray-300 mb-1">Swing Backtest Parameters</h3>
+      <p className="text-xs text-gray-600 mb-4">
+        Uses 1H base data, resampled to 4H / 1D / 1W internally. Requires ~1 year of historical data before start date for indicator warm-up.
+      </p>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Field label="Symbol">
@@ -50,34 +50,33 @@ export default function BacktestForm({ onResult }) {
         </Field>
 
         <Field label="Start Date">
-          <input type="date" className="input" value={form.start_date} onChange={(e) => update('start_date', e.target.value)} />
+          <input type="date" className="input" value={form.start_date}
+            onChange={(e) => update('start_date', e.target.value)} />
         </Field>
 
         <Field label="End Date">
-          <input type="date" className="input" value={form.end_date} onChange={(e) => update('end_date', e.target.value)} />
+          <input type="date" className="input" value={form.end_date}
+            onChange={(e) => update('end_date', e.target.value)} />
         </Field>
 
-        <SliderField label={`Trail % (${form.trail_pct}%)`} min={0.3} max={2.0} step={0.1}
-          value={form.trail_pct} onChange={(v) => update('trail_pct', v)} />
+        <SliderField label={`Min R:R (${form.min_rr_ratio}:1)`} min={2.0} max={5.0} step={0.5}
+          value={form.min_rr_ratio} onChange={(v) => update('min_rr_ratio', v)} />
 
-        <SliderField label={`Take Profit % (${form.take_profit_pct}%)`} min={0.5} max={3.0} step={0.1}
-          value={form.take_profit_pct} onChange={(v) => update('take_profit_pct', v)} />
+        <SliderField label={`ATR Multiplier (${form.atr_1h_multiplier}×)`} min={1.0} max={3.0} step={0.25}
+          value={form.atr_1h_multiplier} onChange={(v) => update('atr_1h_multiplier', v)} />
 
-        <SliderField label={`Stop Loss % (${form.hard_sl_pct}%)`} min={0.3} max={2.0} step={0.1}
-          value={form.hard_sl_pct} onChange={(v) => update('hard_sl_pct', v)} />
+        <SliderField label={`Max Hold (${form.max_hold_hours}h)`} min={24} max={168} step={24}
+          value={form.max_hold_hours} onChange={(v) => update('max_hold_hours', v)} />
 
-        <SliderField label={`Max Hold (${form.max_hold_minutes}m)`} min={10} max={60} step={5}
-          value={form.max_hold_minutes} onChange={(v) => update('max_hold_minutes', v)} />
+        <SliderField label={`Fib Tolerance (${form.daily_pullback_tolerance}%)`} min={0.5} max={3.0} step={0.5}
+          value={form.daily_pullback_tolerance} onChange={(v) => update('daily_pullback_tolerance', v)} />
       </div>
 
       {error && <p className="mt-3 text-red-400 text-sm">{error}</p>}
 
-      <button
-        onClick={run}
-        disabled={loading}
-        className="mt-5 w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white py-2 rounded-lg font-semibold text-sm transition-colors"
-      >
-        {loading ? 'Running Backtest...' : 'Run Backtest'}
+      <button onClick={run} disabled={loading}
+        className="mt-5 w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white py-2 rounded-lg font-semibold text-sm transition-colors">
+        {loading ? 'Running Swing Backtest...' : 'Run Backtest'}
       </button>
     </div>
   )
@@ -95,15 +94,9 @@ function Field({ label, children }) {
 function SliderField({ label, min, max, step, value, onChange }) {
   return (
     <Field label={label}>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
+      <input type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))}
-        className="w-full accent-indigo-500"
-      />
+        className="w-full accent-indigo-500" />
     </Field>
   )
 }

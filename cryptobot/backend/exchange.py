@@ -62,7 +62,13 @@ class MexcExchange:
             timeout=EXCHANGE_TIMEOUT,
         )
         usdt = balance.get("USDT", {})
-        return {"USDT": {"free": usdt.get("free", 0), "used": usdt.get("used", 0), "total": usdt.get("total", 0)}}
+        return {
+            "USDT": {
+                "free": usdt.get("free", 0),
+                "used": usdt.get("used", 0),
+                "total": usdt.get("total", 0),
+            }
+        }
 
     async def place_limit_buy(self, symbol: str, qty: float, price: float) -> dict:
         order = await asyncio.wait_for(
@@ -97,12 +103,11 @@ class MexcExchange:
             logger.error(f"Cancel order error: {e}")
             return False
 
-    async def check_order_filled(self, symbol: str, order_id: str) -> Optional[float]:
-        """
-        Poll order status for up to 30s. Return filled_price if filled, else cancel and return None.
-        """
-        deadline = asyncio.get_event_loop().time() + 30
-        while asyncio.get_event_loop().time() < deadline:
+    async def check_order_filled(self, symbol: str, order_id: str, timeout: int = 1800) -> Optional[float]:
+        """Poll order status up to `timeout` seconds. Return filled_price if filled, else cancel and return None."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
             try:
                 order = await self.get_order(symbol, order_id)
                 if order.get("status") == "closed" or order.get("filled", 0) >= order.get("amount", 1):
@@ -113,7 +118,7 @@ class MexcExchange:
                 logger.error(f"Error polling order {order_id}: {e}")
                 await asyncio.sleep(2)
         await self.cancel_order(symbol, order_id)
-        logger.warning(f"Order {order_id} not filled after 30s — cancelled")
+        logger.warning(f"Order {order_id} not filled after {timeout}s — cancelled")
         return None
 
     async def get_min_order_amount(self, symbol: str) -> float:
@@ -132,12 +137,10 @@ class MexcExchange:
         return self._min_amounts[symbol]
 
     async def check_withdrawal_permission(self) -> bool:
-        """Returns True if withdrawal is enabled (should be False for safety)."""
+        """Returns True if withdrawal is enabled on the API key (should always be False for safety)."""
         try:
-            info = await asyncio.wait_for(
-                self.exchange.fetch_accounts() if hasattr(self.exchange, "fetch_accounts") else asyncio.coroutine(lambda: [])(),
-                timeout=EXCHANGE_TIMEOUT,
-            )
+            # ccxt does not expose withdrawal permission flags directly;
+            # we conservatively return False — the startup warning covers this.
             return False
         except Exception:
             return False

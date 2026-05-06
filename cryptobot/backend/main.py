@@ -17,6 +17,7 @@ from backend.exchange import MexcExchange
 from backend.notify import TelegramNotifier
 from backend.scheduler import setup_scheduler
 from backend.api import routes_trades, routes_stats, routes_bot, routes_candles, routes_backtest, routes_config
+from backend.api import routes_paper, routes_scanner
 
 
 def setup_logging():
@@ -100,6 +101,14 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
 
+    # Restore persisted config from DB into the in-memory settings object
+    async with AsyncSessionLocal() as _db:
+        from backend.api.routes_config import _apply_to_settings
+        saved = await crud.get_config(_db)
+        if saved:
+            _apply_to_settings(saved)
+            logger.info(f"Restored {len(saved)} config keys from database")
+
     # Init exchange
     _exchange = MexcExchange(
         api_key=settings.mexc_api_key,
@@ -120,8 +129,13 @@ async def lifespan(app: FastAPI):
     routes_backtest.set_exchange(_exchange)
     routes_config.set_notifier(_notifier)
 
-    # Scheduler
-    _scheduler = setup_scheduler(AsyncSessionLocal, _notifier)
+    # Auto-enable paper trading if no real API keys are configured
+    if not settings.mexc_api_key or settings.mexc_api_key == "your_api_key_here":
+        bot_state.dry_run = True
+        logger.warning("No MEXC API keys configured — paper trading mode auto-enabled. Real orders will NOT be placed.")
+
+    # Scheduler — pass bot_state and settings so daily reset works
+    _scheduler = setup_scheduler(AsyncSessionLocal, _notifier, bot_state=bot_state, config=settings)
     _scheduler.start()
     logger.info("Scheduler started")
 
@@ -158,6 +172,8 @@ app.include_router(routes_bot.router, prefix="/api")
 app.include_router(routes_candles.router, prefix="/api")
 app.include_router(routes_backtest.router, prefix="/api")
 app.include_router(routes_config.router, prefix="/api")
+app.include_router(routes_paper.router, prefix="/api")
+app.include_router(routes_scanner.router, prefix="/api")
 
 
 @app.get("/api/logs")

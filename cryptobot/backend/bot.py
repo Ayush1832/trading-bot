@@ -1,11 +1,24 @@
+"""
+Precision Swing Bot — multi-timeframe confluence trading loop.
+
+Scan cycle (every 15 minutes):
+  1. Skip if trade already opened today (max 1 trade/day)
+  2. For each symbol: fetch 1W + 1D + 4H + 1H candles (weekly cached)
+  3. Run check_entry_signal() — 5-condition cascade
+  4. If any symbol fires: select_best_signal() → grade A+ > A > B → R:R → divergence
+  5. Open trade with full position; simultaneously set limit orders at TP1 and TP2
+
+Exit monitoring (every 15 s while trade open):
+  - Before TP1: watch for TP1_PARTIAL → execute 50% exit, move SL to breakeven
+  - After TP1:  watch for TAKE_PROFIT_2, TRAILING_SL (ATR-based), BREAKEVEN_SL, TIMEOUT
+"""
+
 import asyncio
 import logging
-import math
 import time
 from datetime import datetime, timezone
 
 import pandas as pd
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import Settings
@@ -14,13 +27,273 @@ from backend.core.websocket import ws_manager
 from backend.db import crud
 from backend.exchange import MexcExchange
 from backend.notify import TelegramNotifier
-from backend.risk import calculate_position_qty, check_rate_limits, check_daily_drawdown
-from backend.strategy import compute_indicators, check_entry_signal, compute_tsl, check_exit
+from backend.paper_trading import paper_trader
+from backend.risk import calculate_position_qty, check_daily_drawdown
+from backend.strategy import (
+    check_entry_signal,
+    select_best_signal,
+    compute_atr_tsl,
+    check_exit,
+)
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 5  # seconds
+SCAN_INTERVAL = 900    # 15 minutes — one 4H candle is 240 min, 1H candle is 60 min
+MONITOR_INTERVAL = 15  # seconds — price check while trade is open
 
+# Minimum 1H candles needed for indicators (EMA200 daily needs 200 daily candles)
+MIN_1H_CANDLES = 100
+MIN_4H_CANDLES = 100
+MIN_1D_CANDLES = 220   # EMA200 needs 200 + buffer
+MIN_1W_CANDLES = 210   # weekly EMA200 needs 200 + buffer
+
+
+# ------------------------------------------------------------------ #
+# Weekly candle cache
+# ------------------------------------------------------------------ #
+
+_weekly_cache: dict[str, pd.DataFrame] = {}   # symbol → cached weekly DataFrame
+_weekly_cache_ts: dict[str, float] = {}        # symbol → timestamp of last cached weekly candle
+
+
+def _should_refresh_weekly(symbol: str, new_df: pd.DataFrame) -> bool:
+    """Return True if the weekly cache should be updated (new weekly candle appeared)."""
+    if symbol not in _weekly_cache or new_df is None or new_df.empty:
+        return True
+    last_ts = float(new_df.iloc[-2]["ts"].timestamp())
+    cached_ts = _weekly_cache_ts.get(symbol, 0.0)
+    return last_ts > cached_ts
+
+
+# ------------------------------------------------------------------ #
+# Fetch all four timeframes for one symbol
+# ------------------------------------------------------------------ #
+
+async def _fetch_4tf(
+    exchange: MexcExchange,
+    symbol: str,
+    config: Settings,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    Fetch 1W, 1D, 4H, 1H candles.
+    Weekly data is cached between scans (only refreshes when a new weekly candle closes).
+    Returns (weekly_df, daily_df, h4_df, h1_df) — any may be None on fetch error.
+    """
+    global _weekly_cache, _weekly_cache_ts
+
+    # Fetch non-weekly in parallel
+    async def _fetch(tf, limit):
+        try:
+            return await exchange.fetch_ohlcv(symbol, tf, limit=limit)
+        except Exception as e:
+            logger.warning(f"[FETCH] {symbol} {tf}: {e}")
+            return None
+
+    daily_f = _fetch(config.tf_daily, MIN_1D_CANDLES + 10)
+    h4_f    = _fetch(config.tf_4h,    MIN_4H_CANDLES + 10)
+    h1_f    = _fetch(config.tf_1h,    MIN_1H_CANDLES + 10)
+
+    daily_df, h4_df, h1_df = await asyncio.gather(daily_f, h4_f, h1_f)
+
+    # Weekly: fetch fresh then decide whether to update cache
+    try:
+        fresh_weekly = await exchange.fetch_ohlcv(symbol, config.tf_weekly, limit=MIN_1W_CANDLES + 10)
+        if fresh_weekly is not None and not fresh_weekly.empty:
+            if _should_refresh_weekly(symbol, fresh_weekly):
+                _weekly_cache[symbol] = fresh_weekly
+                _weekly_cache_ts[symbol] = float(fresh_weekly.iloc[-2]["ts"].timestamp())
+        weekly_df = _weekly_cache.get(symbol)
+    except Exception as e:
+        logger.warning(f"[FETCH] {symbol} 1w: {e}")
+        weekly_df = _weekly_cache.get(symbol)
+
+    return weekly_df, daily_df, h4_df, h1_df
+
+
+# ------------------------------------------------------------------ #
+# Multi-symbol scanner
+# ------------------------------------------------------------------ #
+
+async def scan_all_symbols(
+    exchange: MexcExchange,
+    state: BotState,
+    config: Settings,
+) -> tuple[str | None, dict | None]:
+    """
+    Scan all configured symbols in parallel (one async task per symbol).
+    Updates state.scanner for dashboard.
+    Returns (best_symbol, signal_dict) or (None, None).
+    """
+    async def _scan_one(symbol: str):
+        weekly_df, daily_df, h4_df, h1_df = await _fetch_4tf(exchange, symbol, config)
+        result = check_entry_signal(weekly_df, daily_df, h4_df, h1_df, symbol=symbol, config=config)
+        return symbol, result
+
+    tasks = [_scan_one(sym) for sym in config.symbols]
+    results = await asyncio.gather(*tasks)
+
+    full_signals = []
+    for symbol, result in results:
+        with state._lock:
+            state.update_scanner(symbol, result)
+        if result.get("signal"):
+            full_signals.append((symbol, result))
+            with state._lock:
+                state.signals_today += 1
+
+    await ws_manager.broadcast({
+        "type": "scanner_update",
+        "data": {sym: s.to_dict() for sym, s in state.scanner.items()},
+    })
+
+    if not full_signals:
+        return None, None
+
+    best_sym, best_sig = select_best_signal(full_signals)
+    logger.info(
+        f"[SIGNAL] {best_sym} grade={best_sig.get('grade')} "
+        f"R:R={best_sig.get('rr_ratio'):.1f} | "
+        f"fib={best_sig.get('values', {}).get('fib_zone')}"
+    )
+    return best_sym, best_sig
+
+
+# ------------------------------------------------------------------ #
+# Crash recovery
+# ------------------------------------------------------------------ #
+
+async def recover_open_trade(state: BotState, db: AsyncSession, notifier: TelegramNotifier):
+    """Restore bot state from DB if a trade was open when bot last stopped."""
+    open_trade = await crud.get_open_trade(db)
+    if open_trade is None:
+        return
+
+    logger.warning(f"[RECOVERY] Found open trade #{open_trade.id} for {open_trade.symbol} — resuming")
+    with state._lock:
+        state.trade_open = True
+        state.trade_opened_today = True
+        state.current_symbol = open_trade.symbol
+        state.entry_price = open_trade.entry_price
+        state.entry_time = open_trade.entry_time.timestamp()
+        state.entry_order_id = open_trade.entry_order_id
+        state.peak_price = open_trade.peak_price or open_trade.entry_price
+        state.sl_price = open_trade.hard_sl_price
+        state.tp1_price = open_trade.take_profit_price
+        state.tp2_price = open_trade.tp2_price
+        state.atr_1h = open_trade.entry_1h_atr
+        state.rr_ratio = open_trade.rr_ratio
+        state.grade = open_trade.grade
+        state.qty_total = open_trade.qty
+        state.half_exited = bool(open_trade.half_exited)
+        state.qty_remaining = open_trade.qty * (0.5 if state.half_exited else 1.0)
+        state.tp1_exit_price = open_trade.tp1_exit_price
+        state.tp1_pnl_usdt = open_trade.tp1_pnl_usdt
+        state.open_trade_id = open_trade.id
+        # Reconstruct TSL: ATR-based if we have atr_1h, else conservative fixed %
+        if state.atr_1h and state.peak_price:
+            from backend.core.config import settings
+            state.trailing_sl = compute_atr_tsl(
+                state.peak_price, state.sl_price or 0,
+                state.atr_1h, settings.atr_1h_multiplier
+            )
+        else:
+            state.trailing_sl = state.sl_price
+
+    await notifier.send_error(
+        f"Bot restarted with open trade #{open_trade.id} ({open_trade.symbol}) — monitoring resumed."
+    )
+
+
+# ------------------------------------------------------------------ #
+# TP1 partial exit helper
+# ------------------------------------------------------------------ #
+
+async def execute_tp1_partial(
+    state: BotState,
+    exchange: MexcExchange,
+    db: AsyncSession,
+    notifier: TelegramNotifier,
+    config: Settings,
+    tp1_fill_price: float,
+):
+    """
+    Execute the 50% partial exit at TP1.
+    - Sells half the position at market
+    - Moves SL to breakeven (entry_price)
+    - Records TP1 P&L to DB
+    - Updates state for second-half monitoring
+    """
+    with state._lock:
+        symbol = state.current_symbol
+        entry_price = state.entry_price
+        qty_total = state.qty_total
+        trade_id = state.open_trade_id
+        dry_run = state.dry_run
+
+    qty_tp1 = qty_total * 0.5
+
+    tp1_order_id = ""
+    actual_fill = tp1_fill_price
+
+    if dry_run:
+        order = paper_trader.simulate_market_sell(symbol, qty_tp1, tp1_fill_price)
+        tp1_order_id = order["id"]
+    else:
+        try:
+            sell = await exchange.place_market_sell(symbol, qty_tp1)
+            actual_fill = sell.get("average") or sell.get("price") or tp1_fill_price
+            tp1_order_id = sell.get("id", "")
+        except Exception as e:
+            logger.error(f"TP1 sell error ({symbol}): {e}")
+            await notifier.send_error(f"TP1 sell failed ({symbol}): {e}")
+            return
+
+    tp1_fee = qty_tp1 * actual_fill * 0.0005
+    tp1_pnl = (actual_fill - entry_price) * qty_tp1 - tp1_fee
+
+    # Move SL to breakeven (entry_price) after TP1
+    breakeven_sl = entry_price
+
+    with state._lock:
+        state.half_exited = True
+        state.qty_remaining = qty_total * 0.5
+        state.sl_price = breakeven_sl
+        state.tp1_exit_price = actual_fill
+        state.tp1_pnl_usdt = tp1_pnl
+        state.tp1_order_id = tp1_order_id
+        # Recalculate TSL from current peak with ATR
+        if state.atr_1h:
+            state.trailing_sl = compute_atr_tsl(
+                state.peak_price or actual_fill,
+                state.trailing_sl or breakeven_sl,
+                state.atr_1h,
+                config.atr_1h_multiplier,
+            )
+
+    if trade_id:
+        await crud.update_trade(db, trade_id, {
+            "half_exited": True,
+            "tp1_exit_price": actual_fill,
+            "tp1_exit_time": datetime.utcnow(),
+            "tp1_pnl_usdt": tp1_pnl,
+            "tp1_order_id": tp1_order_id,
+            "breakeven_sl": breakeven_sl,
+        })
+
+    logger.info(f"[TP1] {symbol} 50%% exited @ {actual_fill:.4f} pnl={tp1_pnl:+.4f} USDT | SL → breakeven")
+    await crud.save_log(db, "TP1", f"{symbol} TP1 partial @ {actual_fill:.4f} pnl={tp1_pnl:+.4f}", trade_id=trade_id)
+
+    trade_dict = {"symbol": symbol, "entry_price": entry_price,
+                  "tp2_price": state.tp2_price, "grade": state.grade}
+    await notifier.send_tp1_partial(trade_dict, actual_fill, tp1_pnl, qty_total * 0.5)
+    await ws_manager.broadcast({"type": "tp1_hit", "data": {
+        "symbol": symbol, "tp1_price": actual_fill, "tp1_pnl_usdt": tp1_pnl,
+    }})
+
+
+# ------------------------------------------------------------------ #
+# Main bot loop
+# ------------------------------------------------------------------ #
 
 async def bot_loop(
     state: BotState,
@@ -29,310 +302,453 @@ async def bot_loop(
     notifier: TelegramNotifier,
     config: Settings,
 ):
-    """
-    Main bot loop. Runs until state.running = False.
-    Safety rules are hardcoded and cannot be bypassed.
-    """
-    logger.info("Bot loop started")
-    await notifier.send_bot_started()
+    """Main loop. Runs until state.running = False."""
 
-    # Safety check: validate min order size on startup
-    min_amount = await exchange.get_min_order_amount(config.symbol)
-    test_qty = calculate_position_qty(min(config.trade_usdt, 1.0), 50000.0, min_amount)
-    if test_qty < min_amount and min_amount > 0:
-        msg = f"Trade qty {test_qty} below exchange minimum {min_amount} for {config.symbol}"
-        logger.error(msg)
-        await notifier.send_error(msg)
+    logger.info("[STARTUP] Precision Swing Strategy — multi-timeframe confluence")
+    logger.info(f"[STARTUP] Symbols: {config.symbols} | Scan: {config.scan_interval_seconds}s")
+    logger.info(f"[STARTUP] Timeframes: {config.tf_weekly} / {config.tf_daily} / {config.tf_4h} / {config.tf_1h}")
+    logger.info(f"[STARTUP] Min R:R: {config.min_rr_ratio} | ATR mult: {config.atr_1h_multiplier} | Max trades/day: {config.max_trades_per_day}")
+    logger.info(f"[STARTUP] Trade size: ${config.trade_usdt} | TP1 at 50%% | TP2 at 5:1 R | Max hold: {config.max_hold_hours}h")
 
-    # Session starting balance for drawdown checks
+    await notifier.send_bot_started(config)
+    await recover_open_trade(state, db, notifier)
+
+    # Fetch min order amounts per symbol
+    min_amounts: dict[str, float] = {}
+    for sym in config.symbols:
+        if exchange.exchange.apiKey:
+            min_amounts[sym] = await exchange.get_min_order_amount(sym)
+        else:
+            min_amounts[sym] = 0.0
+
+    # Starting balance
     try:
-        balance_info = await exchange.get_balance()
-        starting_balance = balance_info["USDT"]["free"]
+        if not state.dry_run:
+            bal = await exchange.get_balance()
+            starting_balance = bal["USDT"]["free"]
+            with state._lock:
+                state.usdt_balance = starting_balance
+        else:
+            starting_balance = paper_trader.starting_balance
+            with state._lock:
+                state.usdt_balance = paper_trader.balance
     except Exception:
         starting_balance = 10.0
 
+    if not state.dry_run and starting_balance < config.trade_usdt * 1.1:
+        await notifier.send_error(
+            f"Balance too low: ${starting_balance:.2f} (need ${config.trade_usdt * 1.1:.2f})"
+        )
+
     daily_pnl = 0.0
+    last_scan_time = 0.0   # track when we last did a full 4-TF scan
 
     while state.running:
         try:
             with state._lock:
                 trade_open = state.trade_open
                 dry_run = state.dry_run
+                daily_halted = state.daily_halted
+                trade_opened_today = state.trade_opened_today
 
+            # -------------------------------------------------------- #
+            # NO OPEN TRADE — scan for entry (every SCAN_INTERVAL s)
+            # -------------------------------------------------------- #
             if not trade_open:
-                # --- Check rate limits and daily drawdown ---
-                with state._lock:
-                    allowed, reason = check_rate_limits(
-                        state.trades_this_hour,
-                        config.max_trades_per_hour,
-                        state.last_trade_time,
-                        config.cooldown_seconds,
-                    )
+                now = time.time()
+                time_since_scan = now - last_scan_time
 
-                if not allowed:
-                    logger.info(f"Rate limit: {reason}")
-                    await asyncio.sleep(POLL_INTERVAL)
+                # Daily cap: only 1 trade per day
+                if trade_opened_today or daily_halted:
+                    reason = "daily trade taken" if trade_opened_today else "daily halt"
+                    if time_since_scan >= SCAN_INTERVAL:
+                        logger.info(f"Skipping entry scan — {reason}")
+                        # Still update scanner display even when blocked
+                        await scan_all_symbols(exchange, state, config)
+                        last_scan_time = now
+                    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                if check_daily_drawdown(daily_pnl, starting_balance, config.max_daily_drawdown_pct):
-                    msg = f"Daily drawdown limit hit ({daily_pnl:.4f} USDT). Stopping for the day."
+                # Balance guard
+                if not dry_run:
+                    with state._lock:
+                        bal = state.usdt_balance
+                    if bal < config.trade_usdt * 1.1:
+                        logger.warning(f"Insufficient balance (${bal:.2f}) — skipping entry")
+                        await asyncio.sleep(MONITOR_INTERVAL)
+                        continue
+
+                # Daily drawdown guard
+                if not dry_run and check_daily_drawdown(daily_pnl, starting_balance, config.max_daily_drawdown_pct):
+                    msg = f"Daily drawdown limit hit ({daily_pnl:.4f} USDT). Halting."
                     logger.warning(msg)
                     await notifier.send_error(msg)
                     with state._lock:
-                        state.running = False
-                    break
-
-                # --- Fetch candles and compute indicators ---
-                try:
-                    df = await exchange.fetch_ohlcv(config.symbol, config.timeframe, limit=100)
-                except Exception as e:
-                    logger.error(f"OHLCV fetch error: {e}")
-                    await asyncio.sleep(POLL_INTERVAL)
+                        state.daily_halted = True
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                df = compute_indicators(df)
-                signal_data = check_entry_signal(df)
+                # Only run full 4-TF scan every SCAN_INTERVAL seconds
+                if time_since_scan < SCAN_INTERVAL:
+                    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
+                    await asyncio.sleep(MONITOR_INTERVAL)
+                    continue
 
-                last = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
-                with state._lock:
-                    state.last_ema50 = float(last["ema50"]) if not pd.isna(last["ema50"]) else None
-                    state.last_rsi = float(last["rsi14"]) if not pd.isna(last["rsi14"]) else None
-                    state.last_bb_low = float(last["bb_low"]) if not pd.isna(last["bb_low"]) else None
-                    state.last_bb_high = float(last["bb_high"]) if not pd.isna(last["bb_high"]) else None
-                    state.last_volume_ratio = float(last["vol_ratio"]) if not pd.isna(last["vol_ratio"]) else None
-
+                last_scan_time = now
+                best_sym, best_sig = await scan_all_symbols(exchange, state, config)
                 await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
 
-                if not signal_data["signal"]:
-                    await asyncio.sleep(POLL_INTERVAL)
+                if best_sym is None:
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                logger.info(f"[SIGNAL] Entry signal! {signal_data['reasons']} | Values: {signal_data['values']}")
-                await crud.save_log(db, "SIGNAL", f"Entry signal detected: {signal_data['reasons']}")
+                # --- Place entry order ---
+                vals = best_sig.get("values", {})
+                entry_price_est = vals.get("entry_price") or 0
+                sl_price = best_sig.get("sl_price")
+                tp1_price = best_sig.get("tp1_price")
+                tp2_price = best_sig.get("tp2_price")
+                atr_1h = best_sig.get("atr_1h")
+                rr_ratio = best_sig.get("rr_ratio", 0.0)
+                grade = best_sig.get("grade", "B")
 
-                # --- Calculate qty and place order ---
+                # Fetch live ask price
                 try:
-                    ticker = await exchange.fetch_ticker(config.symbol)
+                    ticker = await exchange.fetch_ticker(best_sym)
                 except Exception as e:
-                    logger.error(f"Ticker fetch error: {e}")
-                    await asyncio.sleep(POLL_INTERVAL)
+                    logger.error(f"Ticker error ({best_sym}): {e}")
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
                 ask_price = ticker.get("ask") or ticker.get("last")
                 if not ask_price:
-                    await asyncio.sleep(POLL_INTERVAL)
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                # SAFETY: never exceed $1 per trade
+                # SAFETY: hard cap at $1.00
                 trade_size = min(config.trade_usdt, 1.0)
-                qty = calculate_position_qty(trade_size, ask_price, min_amount)
+                min_amt = min_amounts.get(best_sym, 0.0)
+                qty = calculate_position_qty(trade_size, ask_price, min_amt)
                 if qty <= 0:
-                    logger.warning(f"Calculated qty={qty} too small, skipping")
-                    await asyncio.sleep(POLL_INTERVAL)
+                    logger.warning(f"Qty too small for {best_sym} @ {ask_price}")
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                logger.info(f"[OPEN] Placing limit buy: qty={qty} @ {ask_price}")
+                # Place order
                 filled_price = None
+                order_id = ""
 
-                if not dry_run:
+                if dry_run:
                     try:
-                        order = await exchange.place_limit_buy(config.symbol, qty, ask_price)
+                        order = paper_trader.simulate_limit_buy(best_sym, qty, ask_price)
                         order_id = order["id"]
-                        await crud.save_log(db, "ORDER", f"Limit buy placed: {order}")
-                        filled_price = await exchange.check_order_filled(config.symbol, order_id)
-                    except Exception as e:
-                        logger.error(f"Order placement error: {e}")
-                        await notifier.send_error(f"Order placement failed: {e}")
-                        await asyncio.sleep(POLL_INTERVAL)
+                        filled_price = ask_price
+                        logger.info(f"[PAPER] Buy {qty:.6f} {best_sym} @ {ask_price:.4f}")
+                    except ValueError as e:
+                        logger.warning(f"[PAPER] Cannot open trade: {e}")
+                        await asyncio.sleep(MONITOR_INTERVAL)
                         continue
                 else:
-                    order_id = f"DRYRUN-{int(time.time())}"
-                    filled_price = ask_price
-                    logger.info(f"[DRY RUN] Simulated fill at {filled_price}")
+                    try:
+                        order = await exchange.place_limit_buy(best_sym, qty, ask_price)
+                        order_id = order["id"]
+                        await crud.save_log(db, "ORDER", f"Limit buy placed: {order}")
+                        filled_price = await exchange.check_order_filled(
+                            best_sym, order_id,
+                            timeout=config.entry_order_timeout_seconds,
+                        )
+                    except Exception as e:
+                        logger.error(f"Order error ({best_sym}): {e}")
+                        await notifier.send_error(f"Order failed ({best_sym}): {e}")
+                        await asyncio.sleep(MONITOR_INTERVAL)
+                        continue
 
                 if filled_price is None:
-                    logger.warning("Order not filled in time, skipping")
-                    await asyncio.sleep(POLL_INTERVAL)
+                    logger.warning(f"Order not filled for {best_sym}")
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                # --- Open trade ---
-                tp_price = filled_price * (1 + config.take_profit_pct)
-                hard_sl = filled_price * (1 - config.hard_sl_pct)
-                tsl = compute_tsl(filled_price, config.trail_pct)
-                now = time.time()
+                # Initial ATR-based TSL: peak = filled_price initially
+                initial_tsl = sl_price  # start at hard SL; ATR will push it up as price rises
+                if atr_1h:
+                    initial_tsl = max(
+                        compute_atr_tsl(filled_price, sl_price or 0, atr_1h, config.atr_1h_multiplier),
+                        sl_price or 0,
+                    )
 
+                now_ts = time.time()
                 trade_record = await crud.create_trade(db, {
-                    "symbol": config.symbol,
+                    "symbol": best_sym,
                     "entry_time": datetime.utcnow(),
                     "entry_price": filled_price,
                     "qty": qty,
                     "trade_usdt": trade_size,
-                    "take_profit_price": tp_price,
-                    "hard_sl_price": hard_sl,
-                    "trail_pct": config.trail_pct,
+                    "take_profit_price": tp1_price,
+                    "tp2_price": tp2_price,
+                    "hard_sl_price": sl_price,
+                    "trail_pct": None,
                     "status": "OPEN",
                     "entry_order_id": order_id,
-                    "entry_fee": trade_size * 0.001,
+                    "entry_fee": 0.0,
                     "tsl_update_count": 0,
                     "is_backtest": False,
+                    # Swing snapshot
+                    "rr_ratio": rr_ratio,
+                    "grade": grade,
+                    "entry_divergence_strength": vals.get("divergence_strength"),
+                    "entry_nearest_fib": vals.get("fib_zone") or vals.get("nearest_fib"),
+                    "entry_1h_atr": atr_1h,
                 })
+
+                if dry_run:
+                    paper_trader.open_trade(
+                        symbol=best_sym, qty=qty, entry_price=filled_price,
+                        trade_usdt=trade_size,
+                        take_profit_price=tp1_price,
+                        hard_sl_price=sl_price,
+                        trail_pct=0.0,
+                        trailing_sl=initial_tsl,
+                    )
 
                 with state._lock:
                     state.trade_open = True
+                    state.trade_opened_today = True
+                    state.current_symbol = best_sym
                     state.entry_price = filled_price
-                    state.entry_time = now
+                    state.entry_time = now_ts
                     state.entry_order_id = order_id
                     state.peak_price = filled_price
-                    state.trailing_sl = tsl
-                    state.take_profit_price = tp_price
-                    state.hard_sl_price = hard_sl
-                    state.trade_qty = qty
-                    state.trades_this_hour.append(now)
-                    state.last_trade_time = now
+                    state.trailing_sl = initial_tsl
+                    state.sl_price = sl_price
+                    state.tp1_price = tp1_price
+                    state.tp2_price = tp2_price
+                    state.atr_1h = atr_1h
+                    state.rr_ratio = rr_ratio
+                    state.grade = grade
+                    state.qty_total = qty
+                    state.qty_remaining = qty
+                    state.half_exited = False
+                    state.tp1_exit_price = None
+                    state.tp1_pnl_usdt = None
+                    state.last_trade_time = now_ts
                     state.open_trade_id = trade_record.id
 
-                logger.info(f"[OPEN] Trade opened: entry={filled_price} TP={tp_price:.2f} SL={hard_sl:.2f} TSL={tsl:.2f}")
-                await crud.save_log(db, "OPEN", f"Trade opened: entry={filled_price:.2f}, qty={qty}", trade_id=trade_record.id)
-                await notifier.send_trade_opened(trade_record.to_dict())
+                logger.info(
+                    f"[OPEN] {best_sym} grade={grade} entry={filled_price:.4f} "
+                    f"SL={sl_price:.4f} TP1={tp1_price:.4f} TP2={tp2_price:.4f} R:R={rr_ratio:.1f}"
+                )
+                await crud.save_log(db, "OPEN", f"{best_sym} opened @ {filled_price:.4f} grade={grade} R:R={rr_ratio:.1f}", trade_id=trade_record.id)
+                await notifier.send_trade_opened(trade_record.to_dict(), vals)
                 await ws_manager.broadcast({"type": "trade_opened", "data": trade_record.to_dict()})
+                await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
 
+            # -------------------------------------------------------- #
+            # TRADE OPEN — monitor exit conditions (every 15 s)
+            # -------------------------------------------------------- #
             else:
-                # --- Trade is open — monitor for exit ---
                 with state._lock:
+                    active_sym = state.current_symbol
                     entry_price = state.entry_price
                     entry_time = state.entry_time
                     peak_price = state.peak_price
                     trailing_sl = state.trailing_sl
-                    trade_qty = state.trade_qty
+                    sl_price = state.sl_price
+                    tp1_price = state.tp1_price
+                    tp2_price = state.tp2_price
+                    atr_1h = state.atr_1h
+                    half_exited = state.half_exited
+                    qty_remaining = state.qty_remaining
                     trade_id = state.open_trade_id
-                    dry_run = state.dry_run
 
+                # Fetch current price
                 try:
-                    ticker = await exchange.fetch_ticker(config.symbol)
+                    ticker = await exchange.fetch_ticker(active_sym)
                     current_price = ticker.get("last") or ticker.get("bid")
                 except Exception as e:
-                    logger.error(f"Ticker fetch error during trade: {e}")
-                    await asyncio.sleep(POLL_INTERVAL)
+                    logger.error(f"Ticker error ({active_sym}): {e}")
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
                 if not current_price:
-                    await asyncio.sleep(POLL_INTERVAL)
+                    await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 
-                unrealized_pnl_pct = (current_price - entry_price) / entry_price * 100
+                unrealized_pct = (current_price - entry_price) / entry_price * 100
                 with state._lock:
                     state.current_price = current_price
-                    state.unrealized_pnl_pct = unrealized_pnl_pct
+                    state.unrealized_pnl_pct = unrealized_pct
 
-                # Update TSL if new high
-                old_tsl = trailing_sl
+                # Update peak + ATR-based TSL (only moves up)
                 if current_price > peak_price:
                     new_peak = current_price
-                    new_tsl = compute_tsl(new_peak, config.trail_pct)
+                    old_tsl = trailing_sl
+                    new_tsl = compute_atr_tsl(
+                        new_peak,
+                        trailing_sl,
+                        atr_1h or (entry_price * 0.01),   # fallback: 1% of price if ATR missing
+                        config.atr_1h_multiplier,
+                    )
                     with state._lock:
                         state.peak_price = new_peak
                         state.trailing_sl = new_tsl
                     peak_price = new_peak
                     trailing_sl = new_tsl
 
-                    # Broadcast TSL update if it moved > 0.1%
-                    tsl_move_pct = abs((new_tsl - old_tsl) / old_tsl) if old_tsl else 0
-                    if tsl_move_pct > 0.001:
+                    if abs((new_tsl - old_tsl) / max(old_tsl, 1e-9)) > 0.001:
                         trade_dict = {
-                            "symbol": config.symbol,
+                            "symbol": active_sym,
                             "entry_price": entry_price,
                             "peak_price": new_peak,
-                            "trail_pct": config.trail_pct,
                         }
                         await notifier.send_tsl_updated(trade_dict, old_tsl, new_tsl)
                         if trade_id:
                             existing = await crud.get_trade(db, trade_id)
                             if existing:
-                                await crud.update_trade(db, trade_id, {"tsl_update_count": existing.tsl_update_count + 1, "peak_price": new_peak})
-                        await ws_manager.broadcast({"type": "tsl_updated", "data": {"old_tsl": old_tsl, "new_tsl": new_tsl, "peak": new_peak}})
-                        logger.info(f"[TSL] Updated: {old_tsl:.2f} → {new_tsl:.2f} (peak={new_peak:.2f})")
-                        await crud.save_log(db, "TSL", f"TSL updated: {old_tsl:.2f} → {new_tsl:.2f}", trade_id=trade_id)
+                                await crud.update_trade(db, trade_id, {
+                                    "tsl_update_count": existing.tsl_update_count + 1,
+                                    "peak_price": new_peak,
+                                })
+                        await ws_manager.broadcast({"type": "tsl_updated", "data": {
+                            "old_tsl": old_tsl, "new_tsl": new_tsl, "peak": new_peak,
+                        }})
+                        logger.info(f"[TSL] {active_sym}: {old_tsl:.4f} → {new_tsl:.4f}")
+                        await crud.save_log(db, "TSL", f"TSL: {old_tsl:.4f} → {new_tsl:.4f}", trade_id=trade_id)
 
-                # Check exit conditions
+                # Check exit
                 exit_reason = check_exit(
                     current_price=current_price,
-                    entry_price=entry_price,
-                    peak_price=peak_price,
+                    sl_price=sl_price,
                     trailing_sl=trailing_sl,
-                    take_profit_pct=config.take_profit_pct,
-                    hard_sl_pct=config.hard_sl_pct,
+                    tp1_price=tp1_price,
+                    tp2_price=tp2_price,
+                    half_exited=half_exited,
                     entry_time=entry_time,
-                    max_hold_minutes=config.max_hold_minutes,
+                    max_hold_hours=config.max_hold_hours,
                 )
 
                 await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
-                await ws_manager.broadcast({"type": "price_update", "data": {"price": current_price, "timestamp": datetime.utcnow().isoformat()}})
+                await ws_manager.broadcast({"type": "price_update", "data": {
+                    "symbol": active_sym,
+                    "price": current_price,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }})
 
-                if exit_reason:
-                    logger.info(f"[CLOSE] Exit triggered: {exit_reason} @ {current_price}")
+                # TP1 partial exit (not a full close)
+                if exit_reason == "TP1_PARTIAL":
+                    await execute_tp1_partial(
+                        state, exchange, db, notifier, config,
+                        tp1_fill_price=current_price,
+                    )
+                    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
+                    await asyncio.sleep(MONITOR_INTERVAL)
+                    continue
+
+                # Full exit
+                if exit_reason and exit_reason != "TP1_PARTIAL":
+                    mode = "[PAPER] " if dry_run else ""
+                    logger.info(f"{mode}[CLOSE] {active_sym} {exit_reason} @ {current_price:.4f}")
 
                     exit_price = current_price
-                    if not dry_run:
+                    exit_order_id = ""
+
+                    if dry_run:
+                        order = paper_trader.simulate_market_sell(active_sym, qty_remaining, current_price)
+                        exit_order_id = order["id"]
+                        exit_fee = qty_remaining * exit_price * 0.0005
+                        open_pt = next((t for t in paper_trader.trades if t.exit_price is None), None)
+                        if open_pt:
+                            paper_trader.close_trade(open_pt, exit_price, exit_reason)
+                        with state._lock:
+                            state.usdt_balance = paper_trader.balance
+                    else:
                         try:
-                            sell_order = await exchange.place_market_sell(config.symbol, trade_qty)
+                            sell_order = await exchange.place_market_sell(active_sym, qty_remaining)
                             exit_price = sell_order.get("average") or sell_order.get("price") or current_price
                             exit_order_id = sell_order.get("id", "")
-                            exit_fee = (trade_qty * exit_price) * 0.001
-                            await crud.save_log(db, "ORDER", f"Market sell placed: {sell_order}", trade_id=trade_id)
+                            exit_fee = qty_remaining * exit_price * 0.0005
+                            await crud.save_log(db, "ORDER", f"Market sell: {sell_order}", trade_id=trade_id)
                         except Exception as e:
-                            logger.error(f"Sell order error: {e}")
-                            await notifier.send_error(f"Sell order failed: {e}")
-                            await asyncio.sleep(POLL_INTERVAL)
+                            logger.error(f"Sell error ({active_sym}): {e}")
+                            await notifier.send_error(f"Sell failed ({active_sym}): {e}")
+                            await asyncio.sleep(MONITOR_INTERVAL)
                             continue
-                    else:
-                        exit_order_id = f"DRYRUN-EXIT-{int(time.time())}"
-                        exit_fee = (trade_qty * exit_price) * 0.001
-                        logger.info(f"[DRY RUN] Simulated sell at {exit_price}")
 
-                    pnl_usdt = (exit_price - entry_price) * trade_qty - exit_fee
-                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+                    # Final leg P&L
+                    final_pnl = (exit_price - entry_price) * qty_remaining - exit_fee
+                    final_pct = (exit_price - entry_price) / entry_price * 100
 
-                    now_dt = datetime.utcnow()
-                    update_data = {
-                        "exit_time": now_dt,
+                    with state._lock:
+                        tp1_pnl = state.tp1_pnl_usdt or 0.0
+                    total_pnl = tp1_pnl + final_pnl
+                    total_pct = (total_pnl / config.trade_usdt * 100) if config.trade_usdt > 0 else final_pct
+
+                    closed_trade = await crud.update_trade(db, trade_id, {
+                        "exit_time": datetime.utcnow(),
                         "exit_price": exit_price,
                         "peak_price": peak_price,
                         "trailing_sl_final": trailing_sl,
-                        "pnl_usdt": pnl_usdt,
-                        "pnl_pct": pnl_pct,
+                        "pnl_usdt": final_pnl,
+                        "pnl_pct": final_pct,
                         "exit_reason": exit_reason,
                         "status": "CLOSED",
                         "exit_order_id": exit_order_id,
                         "exit_fee": exit_fee,
-                    }
-                    closed_trade = await crud.update_trade(db, trade_id, update_data)
+                        "total_pnl_usdt": total_pnl,
+                        "total_pnl_pct": total_pct,
+                    })
 
-                    daily_pnl += pnl_usdt
+                    if not dry_run:
+                        daily_pnl += total_pnl
+                        try:
+                            bal = await exchange.get_balance()
+                            with state._lock:
+                                state.usdt_balance = bal["USDT"]["free"]
+                        except Exception:
+                            pass
+
+                    win = total_pnl > 0
+
                     with state._lock:
                         state.trade_open = False
+                        state.current_symbol = None
                         state.entry_price = None
                         state.entry_time = None
                         state.entry_order_id = None
                         state.peak_price = None
                         state.trailing_sl = None
-                        state.take_profit_price = None
-                        state.hard_sl_price = None
-                        state.trade_qty = None
+                        state.sl_price = None
+                        state.tp1_price = None
+                        state.tp2_price = None
+                        state.atr_1h = None
+                        state.rr_ratio = None
+                        state.grade = None
+                        state.qty_total = None
+                        state.qty_remaining = None
+                        state.half_exited = False
+                        state.tp1_exit_price = None
+                        state.tp1_pnl_usdt = None
+                        state.tp1_order_id = None
                         state.current_price = None
                         state.unrealized_pnl_pct = None
                         state.open_trade_id = None
                         state.last_trade_time = time.time()
                         state.session_trades += 1
-                        if pnl_usdt > 0:
+                        state.trades_today += 1
+                        if win:
                             state.session_wins += 1
-                        state.session_pnl_usdt += pnl_usdt
+                            state.wins_today += 1
+                        else:
+                            state.losses_today += 1
+                        state.session_pnl_usdt += total_pnl
+                        state.pnl_today_usdt += total_pnl
 
-                    logger.info(f"[CLOSE] Trade closed: exit={exit_price:.2f} PnL={pnl_usdt:+.4f} USDT ({pnl_pct:+.2f}%) reason={exit_reason}")
-                    await crud.save_log(db, "CLOSE", f"Trade closed: {exit_reason} exit={exit_price:.2f} pnl={pnl_usdt:+.4f}", trade_id=trade_id)
-
+                    logger.info(f"{mode}[CLOSE] {active_sym} total_pnl={total_pnl:+.4f} USDT ({total_pct:+.2f}%) reason={exit_reason}")
+                    await crud.save_log(db, "CLOSE", f"{mode}{active_sym} closed: {exit_reason} @ {exit_price:.4f} total_pnl={total_pnl:+.4f}", trade_id=trade_id)
                     if closed_trade:
                         await notifier.send_trade_closed(closed_trade.to_dict())
                         await ws_manager.broadcast({"type": "trade_closed", "data": closed_trade.to_dict()})
+                    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
 
         except Exception as e:
             logger.exception(f"Bot loop error: {e}")
@@ -340,7 +756,7 @@ async def bot_loop(
             await asyncio.sleep(10)
             continue
 
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(MONITOR_INTERVAL)
 
     logger.info("Bot loop exited")
-    await notifier.send_bot_stopped("Manual stop or drawdown limit")
+    await notifier.send_bot_stopped("Manual stop")

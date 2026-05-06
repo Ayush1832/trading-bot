@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, patch
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client():
     from backend.main import app
     with TestClient(app) as c:

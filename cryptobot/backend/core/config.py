@@ -1,5 +1,6 @@
-from pydantic_settings import BaseSettings
 from typing import List
+from pydantic import ConfigDict
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -8,36 +9,90 @@ class Settings(BaseSettings):
     mexc_api_secret: str = ""
     sandbox_mode: bool = False
 
-    # Trading
-    symbol: str = "BTC/USDT"
-    timeframe: str = "1m"
-    trade_usdt: float = 1.0
+    # ------------------------------------------------------------------ #
+    # Multi-symbol watchlist (BTC/ETH/SOL only — swing needs deep liquidity)
+    # ------------------------------------------------------------------ #
+    symbols: List[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    symbol: str = "BTC/USDT"       # primary display symbol
 
-    # Strategy
-    ema_period: int = 50
-    rsi_period: int = 14
-    rsi_oversold: float = 30.0
-    bb_period: int = 20
-    bb_std: float = 2.0
-    volume_multiplier: float = 1.5
+    # ------------------------------------------------------------------ #
+    # Timeframes
+    # ------------------------------------------------------------------ #
+    tf_weekly: str = "1w"
+    tf_daily: str = "1d"
+    tf_4h: str = "4h"
+    tf_1h: str = "1h"
 
-    # Risk / exits
-    trail_pct: float = 0.008
-    take_profit_pct: float = 0.012
-    hard_sl_pct: float = 0.008
-    max_hold_minutes: int = 30
+    # Scan interval: 15 minutes — one new 1H candle every 60 min, no need to check faster
+    scan_interval_seconds: int = 900
 
+    # ------------------------------------------------------------------ #
+    # Trade sizing
+    # ------------------------------------------------------------------ #
+    trade_usdt: float = 1.0         # hard cap enforced in bot.py at $1.00
+    max_trade_usdt: float = 1.0    # explicit hard cap (same value)
+
+    # ------------------------------------------------------------------ #
+    # Strategy — Weekly EMA
+    # ------------------------------------------------------------------ #
+    weekly_ema_period: int = 200
+
+    # ------------------------------------------------------------------ #
+    # Strategy — Daily EMA + Fibonacci
+    # ------------------------------------------------------------------ #
+    daily_ema_fast: int = 50
+    daily_ema_slow: int = 200
+    daily_pullback_tolerance: float = 0.015   # 1.5% — within this % of fib level counts as "in zone"
+
+    # ------------------------------------------------------------------ #
+    # Strategy — 4H Divergence
+    # ------------------------------------------------------------------ #
+    div_max_age_candles: int = 8    # how many 4H candles back to look for divergence
+    div_min_rsi_level: float = 50.0  # RSI at 2nd low must be below this (oversold confirmation)
+
+    # ------------------------------------------------------------------ #
+    # Strategy — 4H Momentum (MACD + volume)
+    # ------------------------------------------------------------------ #
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    volume_weak_seller_ratio: float = 0.85   # volume < 85% of 20-bar avg = weak sellers
+
+    # ------------------------------------------------------------------ #
+    # Strategy — R:R gate
+    # ------------------------------------------------------------------ #
+    min_rr_ratio: float = 3.0       # minimum 3:1 reward-to-risk required for entry
+
+    # ------------------------------------------------------------------ #
+    # Strategy — Exit levels
+    # ------------------------------------------------------------------ #
+    atr_1h_multiplier: float = 1.5  # ATR-based TSL distance = atr_1h × this multiplier
+    tp1_position_size: float = 0.5  # 50% of position closed at TP1
+    max_hold_hours: int = 72        # maximum trade duration (3 days) before TIMEOUT
+    max_hold_minutes: int = 4320   # same expressed in minutes (72h × 60)
+
+    # ------------------------------------------------------------------ #
     # Rate limits
-    cooldown_seconds: int = 120
-    max_trades_per_hour: int = 6
+    # ------------------------------------------------------------------ #
+    max_trades_per_day: int = 1     # swing strategy: one high-quality trade per day
+    cooldown_seconds: int = 0      # no cooldown needed — one-trade-per-day rule replaces it
     max_daily_drawdown_pct: float = 0.05
 
+    # ------------------------------------------------------------------ #
+    # Entry order
+    # ------------------------------------------------------------------ #
+    entry_order_timeout_seconds: int = 1800   # cancel limit buy if not filled within 30 min
+
+    # ------------------------------------------------------------------ #
     # Telegram
+    # ------------------------------------------------------------------ #
     telegram_token: str = ""
     telegram_chat_id: str = ""
     telegram_bot_commands: bool = False
 
+    # ------------------------------------------------------------------ #
     # API server
+    # ------------------------------------------------------------------ #
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     cors_origins: List[str] = ["http://localhost:5173", "http://localhost:3000"]
@@ -45,9 +100,11 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "sqlite+aiosqlite:///./cryptobot.db"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()

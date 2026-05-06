@@ -1,11 +1,10 @@
 import asyncio
 import logging
-from fastapi import APIRouter, BackgroundTasks, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from backend.core.state import bot_state
 from backend.core.config import settings
-from backend.db.database import get_db, AsyncSessionLocal
+from backend.db.database import AsyncSessionLocal
 from backend.exchange import MexcExchange
 from backend.notify import TelegramNotifier
 from backend.bot import bot_loop
@@ -44,7 +43,7 @@ async def start_bot(background_tasks: BackgroundTasks):
     if bot_state.running:
         return {"message": "Bot already running"}
     if _exchange is None:
-        return {"error": "Exchange not initialized — check API keys"}, 400
+        raise HTTPException(status_code=400, detail="Exchange not initialized — check API keys in Settings")
 
     bot_state.running = True
     _bot_task = asyncio.create_task(_run_bot())
@@ -62,15 +61,16 @@ async def stop_bot():
 @router.get("/balance")
 async def get_balance():
     if _exchange is None:
-        return {"error": "Exchange not initialized"}
+        raise HTTPException(status_code=400, detail="Exchange not initialized")
     try:
         balance = await _exchange.get_balance()
         return balance
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/dry-run")
 async def toggle_dry_run(enabled: bool = True):
     bot_state.dry_run = enabled
-    return {"dry_run": bot_state.dry_run}
+    logger.info(f"Dry-run mode {'enabled' if enabled else 'disabled'}")
+    return {"dry_run": bot_state.dry_run, "message": f"Paper trading {'ON' if enabled else 'OFF'}"}
