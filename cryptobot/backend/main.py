@@ -109,10 +109,10 @@ async def lifespan(app: FastAPI):
             _apply_to_settings(saved)
             logger.info(f"Restored {len(saved)} config keys from database")
 
-    # Init exchange
+    # Init exchange — prefer bybit_api_key, fall back to legacy mexc_api_key field
     _exchange = MexcExchange(
-        api_key=settings.mexc_api_key,
-        api_secret=settings.mexc_api_secret,
+        api_key=settings.bybit_api_key or settings.mexc_api_key,
+        api_secret=settings.bybit_api_secret or settings.mexc_api_secret,
         sandbox=settings.sandbox_mode,
     )
 
@@ -130,7 +130,8 @@ async def lifespan(app: FastAPI):
     routes_config.set_notifier(_notifier)
 
     # Auto-enable paper trading if no real API keys are configured
-    if not settings.mexc_api_key or settings.mexc_api_key == "your_api_key_here":
+    api_key = settings.bybit_api_key or settings.mexc_api_key
+    if not api_key or api_key in ("your_api_key_here", "your_bybit_api_key_here"):
         bot_state.dry_run = True
         logger.warning("No MEXC API keys configured — paper trading mode auto-enabled. Real orders will NOT be placed.")
 

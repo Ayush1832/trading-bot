@@ -34,8 +34,8 @@ async def run_backtest_endpoint(req: BacktestRequest):
 
     # Build backtest config inheriting live settings, overriding only what request specifies
     bt_config = Settings(
-        mexc_api_key=settings.mexc_api_key,
-        mexc_api_secret=settings.mexc_api_secret,
+        bybit_api_key=settings.bybit_api_key,
+        bybit_api_secret=settings.bybit_api_secret,
         symbol=req.symbol,
         symbols=[req.symbol],
         # Timeframes

@@ -9,13 +9,16 @@ logger = logging.getLogger(__name__)
 EXCHANGE_TIMEOUT = 10  # seconds for all API calls
 
 
-class MexcExchange:
+class BybitExchange:
     def __init__(self, api_key: str, api_secret: str, sandbox: bool = False):
-        self.exchange = ccxt.mexc({
+        self.exchange = ccxt.bybit({
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": {
+                "defaultType": "spot",
+                "defaultCategory": "spot",  # Bybit V5 API category
+            },
         })
         if sandbox:
             self.exchange.set_sandbox_mode(True)
@@ -57,8 +60,10 @@ class MexcExchange:
         }
 
     async def get_balance(self) -> dict:
+        # Bybit Unified Trading Account returns balances under 'UNIFIED' type;
+        # passing type='spot' ensures we read the spot wallet specifically.
         balance = await asyncio.wait_for(
-            self.exchange.fetch_balance(),
+            self.exchange.fetch_balance({"type": "spot"}),
             timeout=EXCHANGE_TIMEOUT,
         )
         usdt = balance.get("USDT", {})
@@ -138,9 +143,8 @@ class MexcExchange:
 
     async def check_withdrawal_permission(self) -> bool:
         """Returns True if withdrawal is enabled on the API key (should always be False for safety)."""
-        try:
-            # ccxt does not expose withdrawal permission flags directly;
-            # we conservatively return False — the startup warning covers this.
-            return False
-        except Exception:
-            return False
+        return False
+
+
+# Alias for backward compatibility within the codebase
+MexcExchange = BybitExchange

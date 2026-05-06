@@ -61,8 +61,8 @@ def make_synthetic_df(n: int = 200, seed: int = 42) -> pd.DataFrame:
 
 def make_settings(**kwargs) -> Settings:
     defaults = dict(
-        mexc_api_key="",
-        mexc_api_secret="",
+        bybit_api_key="",
+        bybit_api_secret="",
         trade_usdt=1.0,
         trail_pct=0.008,
         take_profit_pct=0.012,

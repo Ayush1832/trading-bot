@@ -18,9 +18,9 @@ def set_notifier(n: TelegramNotifier):
 
 
 class ConfigUpdate(BaseModel):
-    # Exchange
-    mexc_api_key: Optional[str] = None
-    mexc_api_secret: Optional[str] = None
+    # Exchange — Bybit
+    bybit_api_key: Optional[str] = None
+    bybit_api_secret: Optional[str] = None
     sandbox_mode: Optional[bool] = None
 
     # Watchlist
@@ -100,9 +100,9 @@ async def get_config(db: AsyncSession = Depends(get_db)):
     symbols = overrides.get("symbols", ",".join(settings.symbols))
 
     return {
-        # Exchange
-        "mexc_api_key": "***" if settings.mexc_api_key else "",
-        "mexc_api_secret": "***" if settings.mexc_api_secret else "",
+        # Exchange — Bybit
+        "bybit_api_key": "***" if (settings.bybit_api_key or settings.mexc_api_key) else "",
+        "bybit_api_secret": "***" if (settings.bybit_api_secret or settings.mexc_api_secret) else "",
         "sandbox_mode": _db_bool(overrides.get("sandbox_mode"), settings.sandbox_mode),
 
         # Watchlist

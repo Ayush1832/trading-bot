@@ -5,8 +5,8 @@ const ALL_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
 export default function Settings() {
   const [form, setForm] = useState({
-    mexc_api_key: '',
-    mexc_api_secret: '',
+    bybit_api_key: '',
+    bybit_api_secret: '',
     symbol: 'BTC/USDT',
     symbols: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
     trade_usdt: 1.0,
@@ -77,14 +77,14 @@ export default function Settings() {
     <div className="max-w-2xl space-y-6">
       <h2 className="text-lg font-bold">Settings — Swing Strategy</h2>
 
-      <Section title="Exchange">
-        <Field label="MEXC API Key">
-          <input type="password" className="input" value={form.mexc_api_key}
-            onChange={(e) => update('mexc_api_key', e.target.value)} />
+      <Section title="Exchange — Bybit">
+        <Field label="Bybit API Key">
+          <input type="password" className="input" value={form.bybit_api_key}
+            onChange={(e) => update('bybit_api_key', e.target.value)} />
         </Field>
-        <Field label="MEXC API Secret">
-          <input type="password" className="input" value={form.mexc_api_secret}
-            onChange={(e) => update('mexc_api_secret', e.target.value)} />
+        <Field label="Bybit API Secret">
+          <input type="password" className="input" value={form.bybit_api_secret}
+            onChange={(e) => update('bybit_api_secret', e.target.value)} />
         </Field>
         <Field label="Sandbox Mode">
           <label className="flex items-center gap-2 cursor-pointer">

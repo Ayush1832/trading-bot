@@ -4,10 +4,14 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Exchange
+    # Exchange — Bybit
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+    sandbox_mode: bool = False
+
+    # Legacy aliases so existing DB-persisted config keys keep working
     mexc_api_key: str = ""
     mexc_api_secret: str = ""
-    sandbox_mode: bool = False
 
     # ------------------------------------------------------------------ #
     # Multi-symbol watchlist (BTC/ETH/SOL only — swing needs deep liquidity)
