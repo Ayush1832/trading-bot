@@ -103,10 +103,13 @@ function WaitingCard({ botState }) {
   const scanner = useStore((s) => s.scanner)
 
   // Find the symbol with most conditions met
+  const COND_KEYS = ['weekly_ok', 'daily_ok', 'h4_div_ok', 'h4_mom_ok', 'h1_bos_ok']
+  const condCount = (s) => COND_KEYS.filter(k => s[k]).length
+
   const entries = Object.values(scanner || {})
   const best = entries.sort((a, b) => {
     if (b.signal !== a.signal) return b.signal ? 1 : -1
-    return (b.conditions_met ?? 0) - (a.conditions_met ?? 0)
+    return condCount(b) - condCount(a)
   })[0]
 
   const CONDITIONS = [
@@ -141,7 +144,7 @@ function WaitingCard({ botState }) {
             <div className="flex items-center gap-2">
               {best.grade && <GradeBadge grade={best.grade} />}
               <span className="text-xs text-gray-500">
-                {best.conditions_met ?? 0}/5
+                {condCount(best)}/5
               </span>
             </div>
           </div>

@@ -289,12 +289,15 @@ def check_4h_momentum(h4_df: pd.DataFrame, weak_seller_ratio: float = 0.85) -> d
 
     macd_cross = False
     if macd_result is not None and not macd_result.empty:
-        macd_cols = [c for c in macd_result.columns if c.startswith("MACD_") and "h" not in c.lower() and "s" not in c.lower()]
-        sig_cols = [c for c in macd_result.columns if c.startswith("MACDs_")]
+        # pandas_ta names: MACD_12_26_9, MACDs_12_26_9, MACDh_12_26_9
+        # Use explicit names first, fall back to position-based for robustness
+        cols = list(macd_result.columns)
+        macd_col = next((c for c in cols if c.startswith("MACD_") and not c.startswith("MACDs_") and not c.startswith("MACDh_")), cols[0] if cols else None)
+        sig_col = next((c for c in cols if c.startswith("MACDs_")), cols[1] if len(cols) > 1 else None)
 
-        if macd_cols and sig_cols:
-            macd_line = macd_result[macd_cols[0]]
-            signal_line = macd_result[sig_cols[0]]
+        if macd_col and sig_col:
+            macd_line = macd_result[macd_col]
+            signal_line = macd_result[sig_col]
 
             # Look for bullish cross in last 5 closed candles
             for i in range(2, 7):

@@ -4,6 +4,7 @@ const useStore = create((set) => ({
   botState: {
     running: false,
     dry_run: false,
+    sandbox_mode: false,
     trade_open: false,
     trade_opened_today: false,
     current_symbol: null,
@@ -47,6 +48,7 @@ const useStore = create((set) => ({
   scanner: {},
 
   tslPulse: false,
+  wsConnected: false,
 
   setBotState: (data) =>
     set({
@@ -56,7 +58,7 @@ const useStore = create((set) => ({
 
   addLog: (log) =>
     set((state) => ({
-      logs: [...state.logs.slice(-199), log],
+      logs: [...state.logs.slice(-299), log],
     })),
 
   setCandles: (candles, indicators) => set({ candles, indicators }),
@@ -64,6 +66,8 @@ const useStore = create((set) => ({
   setScanner: (data) => set({ scanner: data }),
 
   setTslPulse: (value) => set({ tslPulse: value }),
+
+  setWsConnected: (value) => set({ wsConnected: value }),
 }))
 
 export default useStore

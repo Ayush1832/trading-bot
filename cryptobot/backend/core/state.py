@@ -184,9 +184,11 @@ class BotState:
         self.trade_opened_today = False
 
     def to_dict(self) -> dict:
+        from backend.core.config import settings
         return {
             "running": self.running,
             "dry_run": self.dry_run,
+            "sandbox_mode": settings.sandbox_mode,
             "trade_open": self.trade_open,
             "trade_opened_today": self.trade_opened_today,
             "current_symbol": self.current_symbol,

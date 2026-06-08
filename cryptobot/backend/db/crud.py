@@ -59,11 +59,50 @@ async def get_trades(
     return list(result.scalars().all())
 
 
+async def get_trades_with_count(
+    db: AsyncSession,
+    limit: int = 20,
+    offset: int = 0,
+    symbol: Optional[str] = None,
+    status: Optional[str] = None,
+    exit_reason: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort_by: str = "entry_time",
+    sort_dir: str = "desc",
+    is_backtest: bool = False,
+) -> tuple[list[Trade], int]:
+    base_filters = [Trade.is_backtest == is_backtest]
+    if symbol:
+        base_filters.append(Trade.symbol == symbol)
+    if status:
+        base_filters.append(Trade.status == status)
+    if exit_reason:
+        base_filters.append(Trade.exit_reason == exit_reason)
+    if date_from:
+        base_filters.append(Trade.entry_time >= datetime.fromisoformat(date_from))
+    if date_to:
+        base_filters.append(Trade.entry_time <= datetime.fromisoformat(date_to))
+
+    count_result = await db.execute(select(func.count(Trade.id)).where(*base_filters))
+    total = count_result.scalar() or 0
+
+    col = getattr(Trade, sort_by, Trade.entry_time)
+    q = select(Trade).where(*base_filters)
+    q = q.order_by(desc(col) if sort_dir == "desc" else asc(col))
+    q = q.limit(limit).offset(offset)
+    result = await db.execute(q)
+    return list(result.scalars().all()), total
+
+
 async def get_open_trade(db: AsyncSession) -> Optional[Trade]:
+    # Use first() instead of scalar_one_or_none() to survive duplicate OPEN records
+    # (can happen if bot crashes mid-transaction — MultipleResultsFound would kill recovery)
     result = await db.execute(
         select(Trade).where(Trade.status == "OPEN", Trade.is_backtest == False)
+        .order_by(Trade.id.desc())
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def get_trades_csv(db: AsyncSession) -> str:
@@ -99,26 +138,39 @@ async def get_session_stats(db: AsyncSession) -> dict:
     result = await db.execute(
         select(
             func.count(Trade.id).label("total_trades"),
-            func.sum(Trade.pnl_usdt).label("total_pnl_usdt"),
+            # Use total_pnl_usdt (includes TP1 partial) — fall back to pnl_usdt for old records
+            func.sum(func.coalesce(Trade.total_pnl_usdt, Trade.pnl_usdt)).label("total_pnl_usdt"),
         ).where(Trade.status == "CLOSED", Trade.is_backtest == False)
     )
     row = result.one()
     total = row.total_trades or 0
     pnl = row.total_pnl_usdt or 0.0
 
+    # Win = total_pnl_usdt > 0 (includes TP1 partial P&L, not just final leg)
     wins_result = await db.execute(
         select(func.count(Trade.id)).where(
-            Trade.status == "CLOSED", Trade.pnl_usdt > 0, Trade.is_backtest == False
+            Trade.status == "CLOSED",
+            Trade.is_backtest == False,
+            func.coalesce(Trade.total_pnl_usdt, Trade.pnl_usdt) > 0,
         )
     )
     wins = wins_result.scalar() or 0
+
+    # Additional stats
+    avg_result = await db.execute(
+        select(
+            func.avg(Trade.rr_ratio).label("avg_rr"),
+        ).where(Trade.status == "CLOSED", Trade.is_backtest == False)
+    )
+    avg_row = avg_result.one()
 
     return {
         "total_trades": total,
         "winning_trades": wins,
         "losing_trades": total - wins,
         "win_rate": wins / total if total > 0 else 0.0,
-        "total_pnl_usdt": pnl,
+        "total_pnl_usdt": round(pnl, 6),
+        "avg_rr_ratio": round(avg_row.avg_rr or 0.0, 2),
     }
 
 
@@ -159,14 +211,27 @@ async def get_equity_curve(db: AsyncSession) -> list[dict]:
     curve = []
     cumulative = 0.0
     for t in trades:
-        cumulative += t.pnl_usdt or 0.0
+        # Use total_pnl_usdt (TP1 partial + final leg) for accurate equity curve
+        trade_pnl = t.total_pnl_usdt if t.total_pnl_usdt is not None else (t.pnl_usdt or 0.0)
+        cumulative += trade_pnl
         curve.append({
             "timestamp": t.exit_time.isoformat() if t.exit_time else None,
             "equity_usdt": round(cumulative, 6),
             "trade_id": t.id,
-            "win": (t.pnl_usdt or 0) > 0,
+            "symbol": t.symbol,
+            "grade": t.grade,
+            "exit_reason": t.exit_reason,
+            "win": trade_pnl > 0,
+            "pnl_usdt": round(trade_pnl, 6),
         })
     return curve
+
+
+async def get_trade_count(db: AsyncSession, is_backtest: bool = False) -> int:
+    result = await db.execute(
+        select(func.count(Trade.id)).where(Trade.is_backtest == is_backtest)
+    )
+    return result.scalar() or 0
 
 
 async def save_log(

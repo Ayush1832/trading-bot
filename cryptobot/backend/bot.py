@@ -332,8 +332,11 @@ async def bot_loop(
             starting_balance = paper_trader.starting_balance
             with state._lock:
                 state.usdt_balance = paper_trader.balance
-    except Exception:
+    except Exception as e:
+        logger.error(f"[STARTUP] Balance fetch failed: {e}. Defaulting to $10 for session.")
         starting_balance = 10.0
+        with state._lock:
+            state.usdt_balance = starting_balance
 
     if not state.dry_run and starting_balance < config.trade_usdt * 1.1:
         await notifier.send_error(

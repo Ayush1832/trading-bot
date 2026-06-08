@@ -17,7 +17,8 @@ class BybitExchange:
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
-                "defaultCategory": "spot",  # Bybit V5 API category
+                "defaultCategory": "spot",
+                "recvWindow": 20000,  # 20s window — tolerates laptop clock drift
             },
         })
         if sandbox:
@@ -60,20 +61,28 @@ class BybitExchange:
         }
 
     async def get_balance(self) -> dict:
-        # Bybit Unified Trading Account returns balances under 'UNIFIED' type;
-        # passing type='spot' ensures we read the spot wallet specifically.
-        balance = await asyncio.wait_for(
-            self.exchange.fetch_balance({"type": "spot"}),
-            timeout=EXCHANGE_TIMEOUT,
-        )
-        usdt = balance.get("USDT", {})
-        return {
-            "USDT": {
-                "free": usdt.get("free", 0),
-                "used": usdt.get("used", 0),
-                "total": usdt.get("total", 0),
-            }
-        }
+        # Bybit Unified Trading Account (UTA) — try each account type until one returns a USDT balance.
+        last_error = None
+        for params in [{"type": "unified"}, {"type": "spot"}, {}]:
+            try:
+                balance = await asyncio.wait_for(
+                    self.exchange.fetch_balance(params),
+                    timeout=EXCHANGE_TIMEOUT,
+                )
+                usdt = balance.get("USDT", {})
+                if usdt.get("free") is not None:
+                    return {
+                        "USDT": {
+                            "free": float(usdt.get("free") or 0),
+                            "used": float(usdt.get("used") or 0),
+                            "total": float(usdt.get("total") or 0),
+                        }
+                    }
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Balance fetch with params={params} failed: {e}")
+                continue
+        raise Exception(f"All balance fetch attempts failed. Last error: {last_error}")
 
     async def place_limit_buy(self, symbol: str, qty: float, price: float) -> dict:
         order = await asyncio.wait_for(
