@@ -49,6 +49,7 @@ const useStore = create((set) => ({
 
   tslPulse: false,
   wsConnected: false,
+  selectedSymbol: null, // user-pinned symbol for chart + strategy panel (null = auto)
 
   setBotState: (data) =>
     set({
@@ -68,6 +69,8 @@ const useStore = create((set) => ({
   setTslPulse: (value) => set({ tslPulse: value }),
 
   setWsConnected: (value) => set({ wsConnected: value }),
+
+  setSelectedSymbol: (symbol) => set({ selectedSymbol: symbol }),
 }))
 
 export default useStore

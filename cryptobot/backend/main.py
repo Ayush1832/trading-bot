@@ -122,9 +122,19 @@ async def lifespan(app: FastAPI):
             _apply_to_settings(saved)
             logger.info(f"Restored {len(saved)} config keys from database")
 
+    api_key = settings.bybit_api_key or settings.mexc_api_key
+    api_secret = settings.bybit_api_secret or settings.mexc_api_secret
+    placeholders = ("your_api_key_here", "your_bybit_api_key_here", "your_real_api_key_here")
+    if not api_key or api_key in placeholders:
+        # Placeholder credentials make ccxt hit private endpoints during load_markets()
+        # and fail with "API key is invalid" — run keyless (public data) + paper mode.
+        api_key, api_secret = "", ""
+        bot_state.dry_run = True
+        logger.warning("No API keys configured — paper trading mode auto-enabled.")
+
     _exchange = MexcExchange(
-        api_key=settings.bybit_api_key or settings.mexc_api_key,
-        api_secret=settings.bybit_api_secret or settings.mexc_api_secret,
+        api_key=api_key,
+        api_secret=api_secret,
         sandbox=settings.sandbox_mode,
     )
 
@@ -138,11 +148,6 @@ async def lifespan(app: FastAPI):
     routes_candles.set_exchange(_exchange)
     routes_backtest.set_exchange(_exchange)
     routes_config.set_notifier(_notifier)
-
-    api_key = settings.bybit_api_key or settings.mexc_api_key
-    if not api_key or api_key in ("your_api_key_here", "your_bybit_api_key_here", "your_real_api_key_here"):
-        bot_state.dry_run = True
-        logger.warning("No API keys configured — paper trading mode auto-enabled.")
 
     _scheduler = setup_scheduler(AsyncSessionLocal, _notifier, bot_state=bot_state, config=settings)
     _scheduler.start()
@@ -196,10 +201,10 @@ async def system_health():
     """System health check — exchange connectivity, WS clients, DB, Telegram, uptime."""
     import time as _time
 
-    # Exchange ping
+    # Exchange ping — fetch_time() is public, works with or without API keys
     exchange_ok = False
     exchange_latency_ms = None
-    if _exchange and _exchange.exchange.apiKey:
+    if _exchange:
         try:
             t0 = _time.monotonic()
             await asyncio.wait_for(_exchange.exchange.fetch_time(), timeout=5)

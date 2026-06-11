@@ -2,14 +2,123 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+/* ── Base ─────────────────────────────────────────────────────────────── */
+
+html {
+  background: #07080b;
+  color-scheme: dark;
 }
 
-.scrollbar-thin::-webkit-scrollbar { width: 4px; }
-.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
-.scrollbar-thin::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: #07080b;
+  color: #e8ebf2;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
 
-.input {
-  @apply w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-indigo-500;
+/* Numbers everywhere align in columns */
+.font-mono,
+input[type='number'] {
+  font-feature-settings: 'tnum' 1, 'zero' 1;
+}
+
+::selection {
+  background: rgba(122, 162, 255, 0.28);
+}
+
+/* ── Scrollbars ───────────────────────────────────────────────────────── */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1f2535 transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #1f2535;
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #2b3349;
+}
+
+/* ── Components ───────────────────────────────────────────────────────── */
+
+@layer components {
+  /* Panel — the core surface of the terminal */
+  .panel {
+    @apply bg-ink-900 border border-line rounded-panel;
+  }
+  .panel-raised {
+    @apply bg-ink-850 border border-line rounded-panel;
+  }
+
+  /* Uppercase micro-label used on every panel header / stat */
+  .microlabel {
+    @apply text-3xs font-semibold uppercase tracking-[0.14em] text-tx-dim;
+  }
+
+  /* Inputs */
+  .input {
+    @apply w-full bg-ink-800 border border-line-strong rounded-md px-3 py-2 text-sm text-tx
+      placeholder:text-tx-faint
+      focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30
+      transition-colors duration-150;
+  }
+
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md text-xs font-semibold
+      px-3 py-1.5 transition-all duration-150 select-none
+      focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/40
+      disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent text-tx-2 hover:text-tx hover:bg-ink-800 border border-transparent;
+  }
+  .btn-outline {
+    @apply btn bg-ink-850 text-tx-2 border border-line-strong hover:border-accent/40 hover:text-tx;
+  }
+  .btn-accent {
+    @apply btn bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25;
+  }
+  .btn-up {
+    @apply btn bg-up/15 text-up border border-up/30 hover:bg-up/25;
+  }
+  .btn-down {
+    @apply btn bg-down/15 text-down border border-down/30 hover:bg-down/25;
+  }
+
+  /* Status dot */
+  .dot {
+    @apply inline-block w-1.5 h-1.5 rounded-full shrink-0;
+  }
+}
+
+/* ── Number tick flash (price/PnL updates) ────────────────────────────── */
+
+@keyframes flashUp {
+  0% { color: #5eebb4; }
+  100% { color: inherit; }
+}
+@keyframes flashDown {
+  0% { color: #ff8095; }
+  100% { color: inherit; }
+}
+.flash-up { animation: flashUp 0.7s ease-out; }
+.flash-down { animation: flashDown 0.7s ease-out; }
+
+/* ── Subtle grid texture for hero areas ───────────────────────────────── */
+
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 28px 28px;
 }

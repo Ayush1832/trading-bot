@@ -26,7 +26,12 @@ def test_bot_status(client):
 def test_get_trades_empty(client):
     resp = client.get("/api/trades")
     assert resp.status_code == 200
-    assert isinstance(resp.json(), list)
+    data = resp.json()
+    # Paginated shape: {"trades": [...], "total": n}
+    assert isinstance(data, dict)
+    assert isinstance(data["trades"], list)
+    assert isinstance(data["total"], int)
+    assert data["total"] >= len(data["trades"])
 
 
 def test_get_stats(client):
