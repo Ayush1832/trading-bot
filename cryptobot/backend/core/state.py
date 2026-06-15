@@ -110,6 +110,12 @@ class BotState:
     tp1_exit_price: Optional[float] = None  # filled after TP1 partial
     tp1_pnl_usdt: Optional[float] = None
 
+    # Resting exchange-side stop-loss (catastrophe floor while bot is running OR down)
+    sl_order_id: Optional[str] = None
+    # Guards/counters for safe exits
+    exit_in_progress: bool = False          # set while a bot-driven sell is in flight
+    sell_retry_count: int = 0               # consecutive market-sell failures
+
     # ------------------------------------------------------------------ #
     # Balance tracking
     # ------------------------------------------------------------------ #

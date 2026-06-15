@@ -5,13 +5,22 @@ from typing import Tuple, Optional
 MAX_TRADE_USDT = 1.0  # Hard cap — never exceeded regardless of config
 
 
-def calculate_position_qty(usdt_amount: float, price: float, min_qty: float) -> float:
+def calculate_position_qty(
+    usdt_amount: float, price: float, min_qty: float, fee_rate: float = 0.001
+) -> float:
     """
-    Calculate how many units to buy. Never exceeds min(usdt_amount, 1.0) / price.
+    Calculate how many units to buy so that notional + entry fee stays within
+    the (hard-capped) usdt_amount. Never exceeds min(usdt_amount, 1.0).
     Rounds down to 8 decimal places (safe for most crypto pairs).
+
+    fee_rate accounts for the taker fee the buy will incur, so a $1.00 budget
+    does not actually cost $1.001 and overshoot available balance.
     """
+    if price <= 0:
+        return 0.0
     capped = min(usdt_amount, MAX_TRADE_USDT)
-    raw_qty = capped / price
+    # Spend budget / (price * (1 + fee)) leaves room for the entry fee.
+    raw_qty = capped / (price * (1.0 + max(fee_rate, 0.0)))
     qty = math.floor(raw_qty * 1e8) / 1e8
     if qty < min_qty:
         return 0.0

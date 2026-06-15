@@ -100,11 +100,45 @@ class BybitExchange:
         logger.info(f"[ORDER] Market sell placed: {order}")
         return order
 
+    async def place_stop_loss(self, symbol: str, qty: float, trigger_price: float) -> dict:
+        """
+        Place a resting conditional STOP-MARKET sell on Bybit spot that triggers
+        when the last price falls to `trigger_price`. This is the catastrophe
+        floor: it protects the position even if this bot process is not running.
+
+        Uses ccxt's unified trigger params plus an explicit Bybit triggerDirection
+        (2 = trigger when price falls). Returns the order dict (contains its id).
+        """
+        try:
+            qty = float(self.exchange.amount_to_precision(symbol, qty))
+            trig = float(self.exchange.price_to_precision(symbol, trigger_price))
+        except Exception:
+            trig = trigger_price
+        params = {
+            "triggerPrice": trig,
+            "triggerDirection": 2,   # Bybit v5: 2 = falling price triggers
+        }
+        order = await asyncio.wait_for(
+            self.exchange.create_order(symbol, "market", "sell", qty, None, params),
+            timeout=EXCHANGE_TIMEOUT,
+        )
+        logger.info(f"[ORDER] Stop-loss placed for {symbol} @ trigger {trig}: id={order.get('id')}")
+        return order
+
     async def get_order(self, symbol: str, order_id: str) -> dict:
         return await asyncio.wait_for(
             self.exchange.fetch_order(order_id, symbol),
             timeout=EXCHANGE_TIMEOUT,
         )
+
+    async def get_order_status(self, symbol: str, order_id: str) -> Optional[dict]:
+        """Best-effort order fetch. Returns None on error instead of raising,
+        so monitor-loop reconciliation never crashes the loop."""
+        try:
+            return await self.get_order(symbol, order_id)
+        except Exception as e:
+            logger.warning(f"Could not fetch order {order_id} ({symbol}): {e}")
+            return None
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         try:
@@ -117,8 +151,12 @@ class BybitExchange:
             logger.error(f"Cancel order error: {e}")
             return False
 
-    async def check_order_filled(self, symbol: str, order_id: str, timeout: int = 1800) -> Optional[float]:
-        """Poll order status up to `timeout` seconds. Return filled_price if filled, else cancel and return None."""
+    async def check_order_filled(self, symbol: str, order_id: str, timeout: int = 120) -> Optional[float]:
+        """
+        Poll order status up to `timeout` seconds. Return filled_price if filled.
+        On timeout, cancel the order — but if the cancel fails, re-check status once
+        in case it filled in the meantime (avoids abandoning a live/filled order).
+        """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
@@ -131,8 +169,18 @@ class BybitExchange:
             except Exception as e:
                 logger.error(f"Error polling order {order_id}: {e}")
                 await asyncio.sleep(2)
-        await self.cancel_order(symbol, order_id)
-        logger.warning(f"Order {order_id} not filled after {timeout}s — cancelled")
+
+        cancelled = await self.cancel_order(symbol, order_id)
+        if not cancelled:
+            # Cancel failed — the order may have filled. Check once before giving up.
+            final = await self.get_order_status(symbol, order_id)
+            if final and (final.get("status") == "closed" or final.get("filled", 0) >= final.get("amount", 1)):
+                fp = final.get("average") or final.get("price")
+                logger.warning(f"Order {order_id} filled during cancel attempt @ {fp}")
+                return float(fp) if fp else None
+            logger.error(f"Order {order_id} could not be cancelled and is not confirmed filled — manual check advised")
+        else:
+            logger.warning(f"Order {order_id} not filled after {timeout}s — cancelled")
         return None
 
     async def get_min_order_amount(self, symbol: str) -> float:

@@ -1,0 +1,7 @@
+{
+  // Project runs on Python 3.13 (pandas-ta is incompatible with 3.14).
+  // Without this, Pyrefly/Pylance query the 3.14 interpreter and report
+  // false "Cannot find module" errors for fastapi, ccxt, sqlalchemy, etc.
+  "python.defaultInterpreterPath": "C:\\Python313\\python.exe",
+  "python.analysis.extraPaths": ["cryptobot"]
+}

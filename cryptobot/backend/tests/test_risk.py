@@ -5,7 +5,8 @@ from backend.risk import calculate_position_qty, check_rate_limits, check_daily_
 
 
 def test_calculate_position_qty_basic():
-    qty = calculate_position_qty(1.0, 50000.0, 0.000001)
+    # fee_rate=0 isolates the pure notional/price division
+    qty = calculate_position_qty(1.0, 50000.0, 0.000001, fee_rate=0.0)
     assert qty == pytest.approx(1.0 / 50000.0, rel=1e-6)
 
 
@@ -15,9 +16,18 @@ def test_calculate_position_qty_min_enforced():
 
 
 def test_calculate_position_qty_rounds_down():
-    qty = calculate_position_qty(1.0, 3.0, 0.0)
+    qty = calculate_position_qty(1.0, 3.0, 0.0, fee_rate=0.0)
     # 1/3 = 0.333... → floor to 8dp = 0.33333333
     assert qty == pytest.approx(0.33333333)
+
+
+def test_calculate_position_qty_fee_aware():
+    # With a taker fee, the budget must cover notional + fee, so qty is slightly
+    # smaller than naive budget/price and total cost stays within the budget.
+    fee = 0.001
+    qty = calculate_position_qty(1.0, 50000.0, 0.0, fee_rate=fee)
+    assert qty < 1.0 / 50000.0
+    assert qty * 50000.0 * (1 + fee) <= 1.0
 
 
 def test_check_rate_limits_ok():

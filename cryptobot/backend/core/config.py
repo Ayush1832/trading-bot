@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     trade_usdt: float = 1.0         # hard cap enforced in bot.py at $1.00
     max_trade_usdt: float = 1.0    # explicit hard cap (same value)
 
+    # Bybit spot TAKER fee — 0.1%. Used for sizing (so cost stays under balance)
+    # and for P&L accounting. Was previously hard-coded at 0.0005 (wrong → optimistic P&L).
+    taker_fee_rate: float = 0.001
+
     # ------------------------------------------------------------------ #
     # Strategy — Weekly EMA
     # ------------------------------------------------------------------ #
@@ -85,7 +89,21 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Entry order
     # ------------------------------------------------------------------ #
-    entry_order_timeout_seconds: int = 1800   # cancel limit buy if not filled within 30 min
+    # Cancel the limit buy if not filled within this window. The entry is a
+    # marketable limit at the ask, so it should fill in seconds; a long window
+    # used to block the monitor loop (and risked a stale fill far from signal).
+    entry_order_timeout_seconds: int = 120
+
+    # ------------------------------------------------------------------ #
+    # Exchange-side protection
+    # ------------------------------------------------------------------ #
+    # Place a resting stop-loss order on the exchange after entry so the
+    # downside is protected even if this process is stopped, asleep, or crashed.
+    # The in-process ATR trailing stop still runs on top of this catastrophe floor.
+    use_exchange_stop_loss: bool = True
+    # Give up market-selling after this many consecutive failures and escalate,
+    # rather than silently retrying forever / stranding the trade as OPEN.
+    max_sell_retries: int = 5
 
     # ------------------------------------------------------------------ #
     # Telegram

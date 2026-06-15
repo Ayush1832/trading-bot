@@ -189,6 +189,9 @@ async def recover_open_trade(state: BotState, db: AsyncSession, notifier: Telegr
         state.tp1_exit_price = open_trade.tp1_exit_price
         state.tp1_pnl_usdt = open_trade.tp1_pnl_usdt
         state.open_trade_id = open_trade.id
+        state.sl_order_id = open_trade.sl_order_id
+        state.exit_in_progress = False
+        state.sell_retry_count = 0
         # Reconstruct TSL: ATR-based if we have atr_1h, else conservative fixed %
         if state.atr_1h and state.peak_price:
             from backend.core.config import settings
@@ -205,6 +208,58 @@ async def recover_open_trade(state: BotState, db: AsyncSession, notifier: Telegr
 
 
 # ------------------------------------------------------------------ #
+# Exchange-side stop-loss helpers (catastrophe floor)
+# ------------------------------------------------------------------ #
+
+async def _place_exchange_stop(
+    state: BotState, exchange: MexcExchange, db: AsyncSession,
+    notifier: TelegramNotifier, config: Settings,
+    symbol: str, qty: float, trigger_price: float, trade_id,
+):
+    """
+    Best-effort: place a resting stop-loss on the exchange. Never raises.
+    Stores the order id in state + DB. On failure, alerts but lets the bot
+    continue (the in-process stop still runs as long as the bot is up).
+    """
+    if state.dry_run or not config.use_exchange_stop_loss or not trigger_price:
+        return None
+    try:
+        order = await exchange.place_stop_loss(symbol, qty, trigger_price)
+        sl_id = order.get("id")
+        with state._lock:
+            state.sl_order_id = sl_id
+        if trade_id:
+            await crud.update_trade(db, trade_id, {"sl_order_id": sl_id})
+        await crud.save_log(db, "ORDER", f"{symbol} exchange stop-loss @ {trigger_price:.4f} id={sl_id}", trade_id=trade_id)
+        return sl_id
+    except Exception as e:
+        logger.error(f"[STOP] Failed to place exchange stop-loss for {symbol}: {e}")
+        await notifier.send_error(
+            f"⚠ Exchange stop-loss FAILED for {symbol}: {e}. "
+            f"In-process stop is still active — keep the bot RUNNING until this trade closes."
+        )
+        with state._lock:
+            state.sl_order_id = None
+        return None
+
+
+async def _cancel_resting_stop(state: BotState, exchange: MexcExchange) -> bool:
+    """Cancel the resting exchange stop so its reserved asset is freed for a
+    bot-driven sell. Returns True if there is no stop or it was cancelled."""
+    if state.dry_run:
+        return True
+    with state._lock:
+        sl_id = state.sl_order_id
+        symbol = state.current_symbol
+    if not sl_id:
+        return True
+    ok = await exchange.cancel_order(symbol, sl_id)
+    with state._lock:
+        state.sl_order_id = None
+    return ok
+
+
+# ------------------------------------------------------------------ #
 # TP1 partial exit helper
 # ------------------------------------------------------------------ #
 
@@ -218,77 +273,193 @@ async def execute_tp1_partial(
 ):
     """
     Execute the 50% partial exit at TP1.
-    - Sells half the position at market
-    - Moves SL to breakeven (entry_price)
-    - Records TP1 P&L to DB
-    - Updates state for second-half monitoring
+    - Guards against double-execution (sets half_exited before the async sell)
+    - Cancels the resting full-size stop, sells half at market, moves SL to
+      breakeven, then re-arms a resting stop on the remaining half
+    - Records TP1 P&L to DB and updates state for second-half monitoring
     """
     with state._lock:
+        # Re-entrancy guard: if a sell is already in flight or TP1 is already
+        # done, do nothing. Set half_exited NOW (before the await) so a slow
+        # or ambiguous fill cannot trigger a second partial sell next tick.
+        if state.exit_in_progress or state.half_exited:
+            return
+        state.exit_in_progress = True
         symbol = state.current_symbol
         entry_price = state.entry_price
         qty_total = state.qty_total
         trade_id = state.open_trade_id
         dry_run = state.dry_run
+        hard_sl = state.sl_price
 
     qty_tp1 = qty_total * 0.5
-
     tp1_order_id = ""
     actual_fill = tp1_fill_price
 
-    if dry_run:
-        order = paper_trader.simulate_market_sell(symbol, qty_tp1, tp1_fill_price)
-        tp1_order_id = order["id"]
-    else:
-        try:
-            sell = await exchange.place_market_sell(symbol, qty_tp1)
-            actual_fill = sell.get("average") or sell.get("price") or tp1_fill_price
-            tp1_order_id = sell.get("id", "")
-        except Exception as e:
-            logger.error(f"TP1 sell error ({symbol}): {e}")
-            await notifier.send_error(f"TP1 sell failed ({symbol}): {e}")
-            return
+    try:
+        if dry_run:
+            order = paper_trader.simulate_market_sell(symbol, qty_tp1, tp1_fill_price)
+            tp1_order_id = order["id"]
+        else:
+            # Free the asset reserved by the resting stop before selling.
+            await _cancel_resting_stop(state, exchange)
+            try:
+                sell = await exchange.place_market_sell(symbol, qty_tp1)
+                actual_fill = sell.get("average") or sell.get("price") or tp1_fill_price
+                tp1_order_id = sell.get("id", "")
+            except Exception as e:
+                logger.error(f"TP1 sell error ({symbol}): {e}")
+                await notifier.send_error(f"TP1 sell failed ({symbol}): {e} — re-arming full stop, will retry next tick.")
+                # Re-arm full-size protection and abort this attempt.
+                with state._lock:
+                    state.exit_in_progress = False
+                await _place_exchange_stop(state, exchange, db, notifier, config, symbol, qty_total, hard_sl, trade_id)
+                return
 
-    tp1_fee = qty_tp1 * actual_fill * 0.0005
-    tp1_pnl = (actual_fill - entry_price) * qty_tp1 - tp1_fee
+        tp1_fee = qty_tp1 * actual_fill * config.taker_fee_rate
+        tp1_pnl = (actual_fill - entry_price) * qty_tp1 - tp1_fee
+        breakeven_sl = entry_price
 
-    # Move SL to breakeven (entry_price) after TP1
-    breakeven_sl = entry_price
+        with state._lock:
+            state.half_exited = True
+            state.qty_remaining = qty_total * 0.5
+            state.sl_price = breakeven_sl
+            state.tp1_exit_price = actual_fill
+            state.tp1_pnl_usdt = tp1_pnl
+            state.tp1_order_id = tp1_order_id
+            if state.atr_1h:
+                state.trailing_sl = compute_atr_tsl(
+                    state.peak_price or actual_fill,
+                    state.trailing_sl or breakeven_sl,
+                    state.atr_1h,
+                    config.atr_1h_multiplier,
+                )
+            state.exit_in_progress = False
 
+        if trade_id:
+            await crud.update_trade(db, trade_id, {
+                "half_exited": True,
+                "tp1_exit_price": actual_fill,
+                "tp1_exit_time": datetime.utcnow(),
+                "tp1_pnl_usdt": tp1_pnl,
+                "tp1_order_id": tp1_order_id,
+                "breakeven_sl": breakeven_sl,
+            })
+
+        # Re-arm a resting stop on the remaining half, now at breakeven.
+        await _place_exchange_stop(state, exchange, db, notifier, config, symbol, qty_tp1, breakeven_sl, trade_id)
+
+        logger.info(f"[TP1] {symbol} 50%% exited @ {actual_fill:.4f} pnl={tp1_pnl:+.4f} USDT | SL → breakeven")
+        await crud.save_log(db, "TP1", f"{symbol} TP1 partial @ {actual_fill:.4f} pnl={tp1_pnl:+.4f}", trade_id=trade_id)
+
+        trade_dict = {"symbol": symbol, "entry_price": entry_price,
+                      "tp2_price": state.tp2_price, "grade": state.grade}
+        await notifier.send_tp1_partial(trade_dict, actual_fill, tp1_pnl, qty_tp1)
+        await ws_manager.broadcast({"type": "tp1_hit", "data": {
+            "symbol": symbol, "tp1_price": actual_fill, "tp1_pnl_usdt": tp1_pnl,
+        }})
+    finally:
+        # Never leave the guard stuck on an unexpected error.
+        with state._lock:
+            state.exit_in_progress = False
+
+
+# ------------------------------------------------------------------ #
+# Full-close finalizer (shared by loop exit + stop-fill reconciliation)
+# ------------------------------------------------------------------ #
+
+async def _finalize_full_close(
+    state: BotState,
+    db: AsyncSession,
+    notifier: TelegramNotifier,
+    config: Settings,
+    *,
+    exit_price: float,
+    exit_reason: str,
+    exit_order_id: str,
+    exit_fee: float,
+    mode: str = "",
+) -> float:
+    """
+    Record a completed full close to DB + in-memory state, update counters,
+    send notifications. The actual sell (or stop fill) must already have happened.
+    Returns total_pnl so the caller can update its daily_pnl accumulator.
+    """
     with state._lock:
-        state.half_exited = True
-        state.qty_remaining = qty_total * 0.5
-        state.sl_price = breakeven_sl
-        state.tp1_exit_price = actual_fill
-        state.tp1_pnl_usdt = tp1_pnl
-        state.tp1_order_id = tp1_order_id
-        # Recalculate TSL from current peak with ATR
-        if state.atr_1h:
-            state.trailing_sl = compute_atr_tsl(
-                state.peak_price or actual_fill,
-                state.trailing_sl or breakeven_sl,
-                state.atr_1h,
-                config.atr_1h_multiplier,
-            )
+        active_sym = state.current_symbol
+        entry_price = state.entry_price
+        qty_remaining = state.qty_remaining
+        trade_id = state.open_trade_id
+        peak_price = state.peak_price
+        trailing_sl = state.trailing_sl
+        tp1_pnl = state.tp1_pnl_usdt or 0.0
 
-    if trade_id:
-        await crud.update_trade(db, trade_id, {
-            "half_exited": True,
-            "tp1_exit_price": actual_fill,
-            "tp1_exit_time": datetime.utcnow(),
-            "tp1_pnl_usdt": tp1_pnl,
-            "tp1_order_id": tp1_order_id,
-            "breakeven_sl": breakeven_sl,
-        })
+    final_pnl = (exit_price - entry_price) * (qty_remaining or 0.0) - exit_fee
+    final_pct = (exit_price - entry_price) / entry_price * 100 if entry_price else 0.0
+    total_pnl = tp1_pnl + final_pnl
+    total_pct = (total_pnl / config.trade_usdt * 100) if config.trade_usdt > 0 else final_pct
 
-    logger.info(f"[TP1] {symbol} 50%% exited @ {actual_fill:.4f} pnl={tp1_pnl:+.4f} USDT | SL → breakeven")
-    await crud.save_log(db, "TP1", f"{symbol} TP1 partial @ {actual_fill:.4f} pnl={tp1_pnl:+.4f}", trade_id=trade_id)
+    closed_trade = await crud.update_trade(db, trade_id, {
+        "exit_time": datetime.utcnow(),
+        "exit_price": exit_price,
+        "peak_price": peak_price,
+        "trailing_sl_final": trailing_sl,
+        "pnl_usdt": final_pnl,
+        "pnl_pct": final_pct,
+        "exit_reason": exit_reason,
+        "status": "CLOSED",
+        "exit_order_id": exit_order_id,
+        "exit_fee": exit_fee,
+        "total_pnl_usdt": total_pnl,
+        "total_pnl_pct": total_pct,
+        "sl_order_id": None,
+    })
 
-    trade_dict = {"symbol": symbol, "entry_price": entry_price,
-                  "tp2_price": state.tp2_price, "grade": state.grade}
-    await notifier.send_tp1_partial(trade_dict, actual_fill, tp1_pnl, qty_total * 0.5)
-    await ws_manager.broadcast({"type": "tp1_hit", "data": {
-        "symbol": symbol, "tp1_price": actual_fill, "tp1_pnl_usdt": tp1_pnl,
-    }})
+    win = total_pnl > 0
+    with state._lock:
+        state.trade_open = False
+        state.current_symbol = None
+        state.entry_price = None
+        state.entry_time = None
+        state.entry_order_id = None
+        state.peak_price = None
+        state.trailing_sl = None
+        state.sl_price = None
+        state.tp1_price = None
+        state.tp2_price = None
+        state.atr_1h = None
+        state.rr_ratio = None
+        state.grade = None
+        state.qty_total = None
+        state.qty_remaining = None
+        state.half_exited = False
+        state.tp1_exit_price = None
+        state.tp1_pnl_usdt = None
+        state.tp1_order_id = None
+        state.sl_order_id = None
+        state.exit_in_progress = False
+        state.sell_retry_count = 0
+        state.current_price = None
+        state.unrealized_pnl_pct = None
+        state.open_trade_id = None
+        state.last_trade_time = time.time()
+        state.session_trades += 1
+        state.trades_today += 1
+        if win:
+            state.session_wins += 1
+            state.wins_today += 1
+        else:
+            state.losses_today += 1
+        state.session_pnl_usdt += total_pnl
+        state.pnl_today_usdt += total_pnl
+
+    logger.info(f"{mode}[CLOSE] {active_sym} total_pnl={total_pnl:+.4f} USDT ({total_pct:+.2f}%) reason={exit_reason}")
+    await crud.save_log(db, "CLOSE", f"{mode}{active_sym} closed: {exit_reason} @ {exit_price:.4f} total_pnl={total_pnl:+.4f}", trade_id=trade_id)
+    if closed_trade:
+        await notifier.send_trade_closed(closed_trade.to_dict())
+        await ws_manager.broadcast({"type": "trade_closed", "data": closed_trade.to_dict()})
+    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
+    return total_pnl
 
 
 # ------------------------------------------------------------------ #
@@ -432,7 +603,7 @@ async def bot_loop(
                 # SAFETY: hard cap at $1.00
                 trade_size = min(config.trade_usdt, 1.0)
                 min_amt = min_amounts.get(best_sym, 0.0)
-                qty = calculate_position_qty(trade_size, ask_price, min_amt)
+                qty = calculate_position_qty(trade_size, ask_price, min_amt, config.taker_fee_rate)
                 if qty <= 0:
                     logger.warning(f"Qty too small for {best_sym} @ {ask_price}")
                     await asyncio.sleep(MONITOR_INTERVAL)
@@ -546,6 +717,14 @@ async def bot_loop(
                 await ws_manager.broadcast({"type": "trade_opened", "data": trade_record.to_dict()})
                 await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
 
+                # Catastrophe floor: rest a stop-loss on the exchange for the full
+                # position at the hard SL. Protects the trade even if this process
+                # stops, sleeps, or crashes. (best-effort; in-process stop still runs)
+                await _place_exchange_stop(
+                    state, exchange, db, notifier, config,
+                    best_sym, qty, sl_price, trade_record.id,
+                )
+
             # -------------------------------------------------------- #
             # TRADE OPEN — monitor exit conditions (every 15 s)
             # -------------------------------------------------------- #
@@ -563,6 +742,35 @@ async def bot_loop(
                     half_exited = state.half_exited
                     qty_remaining = state.qty_remaining
                     trade_id = state.open_trade_id
+                    sl_order_id = state.sl_order_id
+
+                # -------------------------------------------------- #
+                # Reconcile: did the resting exchange stop fill while
+                # we weren't actively selling (e.g. bot was down, or a
+                # gap blew through it)? If so, the exchange already
+                # closed the position — record it and move on.
+                # -------------------------------------------------- #
+                if not dry_run and sl_order_id:
+                    o = await exchange.get_order_status(active_sym, sl_order_id)
+                    if o:
+                        filled = o.get("filled") or 0
+                        amount = o.get("amount") or 0
+                        if o.get("status") == "closed" or (amount and filled >= amount):
+                            stop_fill = o.get("average") or o.get("price") or trailing_sl or sl_price
+                            stop_fee = (filled or qty_remaining or 0.0) * stop_fill * config.taker_fee_rate
+                            reason = "BREAKEVEN_SL" if half_exited else "HARD_SL"
+                            with state._lock:
+                                state.sl_order_id = None
+                            logger.warning(f"[RECONCILE] Exchange stop filled for {active_sym} @ {stop_fill:.4f} — closing out")
+                            await notifier.send_error(f"Exchange stop-loss filled for {active_sym} @ {stop_fill:.4f} ({reason}).")
+                            total = await _finalize_full_close(
+                                state, db, notifier, config,
+                                exit_price=float(stop_fill), exit_reason=reason,
+                                exit_order_id=o.get("id", ""), exit_fee=stop_fee,
+                            )
+                            daily_pnl += total
+                            await asyncio.sleep(MONITOR_INTERVAL)
+                            continue
 
                 # Fetch current price
                 try:
@@ -658,48 +866,58 @@ async def bot_loop(
                     if dry_run:
                         order = paper_trader.simulate_market_sell(active_sym, qty_remaining, current_price)
                         exit_order_id = order["id"]
-                        exit_fee = qty_remaining * exit_price * 0.0005
+                        exit_fee = qty_remaining * exit_price * config.taker_fee_rate
                         open_pt = next((t for t in paper_trader.trades if t.exit_price is None), None)
                         if open_pt:
                             paper_trader.close_trade(open_pt, exit_price, exit_reason)
                         with state._lock:
                             state.usdt_balance = paper_trader.balance
                     else:
+                        with state._lock:
+                            state.exit_in_progress = True
+                        # Free the asset reserved by the resting stop before selling.
+                        await _cancel_resting_stop(state, exchange)
                         try:
                             sell_order = await exchange.place_market_sell(active_sym, qty_remaining)
                             exit_price = sell_order.get("average") or sell_order.get("price") or current_price
                             exit_order_id = sell_order.get("id", "")
-                            exit_fee = qty_remaining * exit_price * 0.0005
+                            exit_fee = qty_remaining * exit_price * config.taker_fee_rate
+                            with state._lock:
+                                state.sell_retry_count = 0
                             await crud.save_log(db, "ORDER", f"Market sell: {sell_order}", trade_id=trade_id)
                         except Exception as e:
-                            logger.error(f"Sell error ({active_sym}): {e}")
-                            await notifier.send_error(f"Sell failed ({active_sym}): {e}")
+                            # The position is still open and still owned. Re-arm a
+                            # protective stop (we just cancelled it), escalate after
+                            # repeated failures, and retry on the next tick — never
+                            # abandon the position or strand it as silently OPEN.
+                            with state._lock:
+                                state.sell_retry_count += 1
+                                retries = state.sell_retry_count
+                                state.exit_in_progress = False
+                            logger.error(f"Sell error ({active_sym}) attempt {retries}: {e}")
+                            await _place_exchange_stop(
+                                state, exchange, db, notifier, config,
+                                active_sym, qty_remaining, trailing_sl or sl_price, trade_id,
+                            )
+                            if retries == config.max_sell_retries:
+                                await notifier.send_error(
+                                    f"🚨 CRITICAL: market sell for {active_sym} has failed {retries}× "
+                                    f"({exit_reason}). Position still open; exchange stop-loss re-armed. "
+                                    f"Check the exchange manually. Will keep retrying."
+                                )
+                            else:
+                                await notifier.send_error(f"Sell failed ({active_sym}) [{retries}]: {e} — retrying next tick.")
                             await asyncio.sleep(MONITOR_INTERVAL)
                             continue
 
-                    # Final leg P&L
-                    final_pnl = (exit_price - entry_price) * qty_remaining - exit_fee
-                    final_pct = (exit_price - entry_price) / entry_price * 100
-
-                    with state._lock:
-                        tp1_pnl = state.tp1_pnl_usdt or 0.0
-                    total_pnl = tp1_pnl + final_pnl
-                    total_pct = (total_pnl / config.trade_usdt * 100) if config.trade_usdt > 0 else final_pct
-
-                    closed_trade = await crud.update_trade(db, trade_id, {
-                        "exit_time": datetime.utcnow(),
-                        "exit_price": exit_price,
-                        "peak_price": peak_price,
-                        "trailing_sl_final": trailing_sl,
-                        "pnl_usdt": final_pnl,
-                        "pnl_pct": final_pct,
-                        "exit_reason": exit_reason,
-                        "status": "CLOSED",
-                        "exit_order_id": exit_order_id,
-                        "exit_fee": exit_fee,
-                        "total_pnl_usdt": total_pnl,
-                        "total_pnl_pct": total_pct,
-                    })
+                    # Single source of truth for close bookkeeping (paper + live).
+                    # _finalize_full_close performs no exchange calls — the sell
+                    # (or paper sell) above already happened.
+                    total_pnl = await _finalize_full_close(
+                        state, db, notifier, config,
+                        exit_price=exit_price, exit_reason=exit_reason,
+                        exit_order_id=exit_order_id, exit_fee=exit_fee, mode=mode,
+                    )
 
                     if not dry_run:
                         daily_pnl += total_pnl
@@ -709,49 +927,6 @@ async def bot_loop(
                                 state.usdt_balance = bal["USDT"]["free"]
                         except Exception:
                             pass
-
-                    win = total_pnl > 0
-
-                    with state._lock:
-                        state.trade_open = False
-                        state.current_symbol = None
-                        state.entry_price = None
-                        state.entry_time = None
-                        state.entry_order_id = None
-                        state.peak_price = None
-                        state.trailing_sl = None
-                        state.sl_price = None
-                        state.tp1_price = None
-                        state.tp2_price = None
-                        state.atr_1h = None
-                        state.rr_ratio = None
-                        state.grade = None
-                        state.qty_total = None
-                        state.qty_remaining = None
-                        state.half_exited = False
-                        state.tp1_exit_price = None
-                        state.tp1_pnl_usdt = None
-                        state.tp1_order_id = None
-                        state.current_price = None
-                        state.unrealized_pnl_pct = None
-                        state.open_trade_id = None
-                        state.last_trade_time = time.time()
-                        state.session_trades += 1
-                        state.trades_today += 1
-                        if win:
-                            state.session_wins += 1
-                            state.wins_today += 1
-                        else:
-                            state.losses_today += 1
-                        state.session_pnl_usdt += total_pnl
-                        state.pnl_today_usdt += total_pnl
-
-                    logger.info(f"{mode}[CLOSE] {active_sym} total_pnl={total_pnl:+.4f} USDT ({total_pct:+.2f}%) reason={exit_reason}")
-                    await crud.save_log(db, "CLOSE", f"{mode}{active_sym} closed: {exit_reason} @ {exit_price:.4f} total_pnl={total_pnl:+.4f}", trade_id=trade_id)
-                    if closed_trade:
-                        await notifier.send_trade_closed(closed_trade.to_dict())
-                        await ws_manager.broadcast({"type": "trade_closed", "data": closed_trade.to_dict()})
-                    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
 
         except Exception as e:
             logger.exception(f"Bot loop error: {e}")
