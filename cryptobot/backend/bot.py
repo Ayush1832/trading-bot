@@ -33,6 +33,7 @@ from backend.strategy import (
     check_entry_signal,
     select_best_signal,
     compute_atr_tsl,
+    compute_rr_ratio,
     check_exit,
 )
 
@@ -46,6 +47,21 @@ MIN_1H_CANDLES = 100
 MIN_4H_CANDLES = 100
 MIN_1D_CANDLES = 220   # EMA200 needs 200 + buffer
 MIN_1W_CANDLES = 210   # weekly EMA200 needs 200 + buffer
+
+
+def should_abort_after_fill(
+    fill_price: float, sl_price: float, tp1_price: float, min_rr: float
+) -> tuple[bool, float]:
+    """
+    After a buy fills, re-check reward:risk using the ACTUAL fill price.
+
+    The signal computes R:R from the planned entry (the 1H close), but a
+    marketable limit can fill higher (slippage), which shrinks reward and grows
+    risk. Returns (abort, actual_rr) — abort is True when the post-fill R:R has
+    dropped below the configured minimum.
+    """
+    actual_rr = compute_rr_ratio(fill_price, sl_price, tp1_price)
+    return (actual_rr < min_rr, actual_rr)
 
 
 # ------------------------------------------------------------------ #
@@ -640,6 +656,47 @@ async def bot_loop(
 
                 if filled_price is None:
                     logger.warning(f"Order not filled for {best_sym}")
+                    await asyncio.sleep(MONITOR_INTERVAL)
+                    continue
+
+                # Post-fill R:R guard — the real fill may differ from the planned
+                # entry (slippage on the marketable limit). Re-check R:R against the
+                # ACTUAL fill; if it no longer clears the minimum, flatten immediately
+                # and do NOT persist the trade.
+                abort, actual_rr = should_abort_after_fill(
+                    filled_price, sl_price, tp1_price, config.min_rr_ratio
+                )
+                if abort:
+                    logger.warning(
+                        f"[ABORT] {best_sym} R:R degraded after fill — planned "
+                        f"{rr_ratio:.2f} vs actual {actual_rr:.2f} (min {config.min_rr_ratio}). "
+                        f"Exiting position immediately."
+                    )
+                    try:
+                        if dry_run:
+                            paper_trader.simulate_market_sell(best_sym, qty, filled_price)
+                            # paper buy only deducted the entry fee (no principal moved),
+                            # so account just the exit fee here to avoid inflating balance.
+                            paper_trader.balance -= qty * filled_price * config.taker_fee_rate
+                            with state._lock:
+                                state.usdt_balance = paper_trader.balance
+                        else:
+                            await exchange.place_market_sell(best_sym, qty)
+                    except Exception as e:
+                        logger.error(f"[ABORT] Failed to flatten {best_sym} after R:R abort: {e}")
+                        await notifier.send_error(
+                            f"⚠ Post-fill R:R abort SELL FAILED for {best_sym}: {e}. "
+                            f"You may be holding an unintended position — check the exchange."
+                        )
+                    await crud.save_log(
+                        db, "ORDER",
+                        f"{best_sym} entry aborted post-fill: R:R {actual_rr:.2f} < {config.min_rr_ratio} (planned {rr_ratio:.2f})",
+                    )
+                    await notifier.send_error(
+                        f"{best_sym} entry aborted: post-fill R:R {actual_rr:.2f} below "
+                        f"minimum {config.min_rr_ratio} (planned {rr_ratio:.2f}). Position flattened."
+                    )
+                    await ws_manager.broadcast({"type": "bot_state", "data": state.to_dict()})
                     await asyncio.sleep(MONITOR_INTERVAL)
                     continue
 

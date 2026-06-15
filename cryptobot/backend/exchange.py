@@ -116,13 +116,18 @@ class BybitExchange:
             trig = trigger_price
         params = {
             "triggerPrice": trig,
-            "triggerDirection": 2,   # Bybit v5: 2 = falling price triggers
+            # Bybit v5 expects an INTEGER triggerDirection (2 = trigger when the
+            # price FALLS to the trigger). Must stay an int, never the string "2".
+            "triggerDirection": int(2),
         }
         order = await asyncio.wait_for(
             self.exchange.create_order(symbol, "market", "sell", qty, None, params),
             timeout=EXCHANGE_TIMEOUT,
         )
         logger.info(f"[ORDER] Stop-loss placed for {symbol} @ trigger {trig}: id={order.get('id')}")
+        # Full response logged so the resting stop can be verified on the exchange
+        # the first time this runs on mainnet (confirm it is a conditional/stop order).
+        logger.info(f"[ORDER] Stop-loss full exchange response for {symbol}: {order}")
         return order
 
     async def get_order(self, symbol: str, order_id: str) -> dict:
