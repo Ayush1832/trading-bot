@@ -8,8 +8,9 @@ import Risk from './pages/Risk.jsx'
 import System from './pages/System.jsx'
 import Settings from './pages/Settings.jsx'
 import { useWebSocket } from './hooks/useWebSocket.js'
+import ApiKeyGate from './shell/ApiKeyGate.jsx'
 
-export default function App() {
+function Shell() {
   useWebSocket()
 
   return (
@@ -32,5 +33,13 @@ export default function App() {
         </div>
       </div>
     </BrowserRouter>
+  )
+}
+
+export default function App() {
+  return (
+    <ApiKeyGate>
+      <Shell />
+    </ApiKeyGate>
   )
 }

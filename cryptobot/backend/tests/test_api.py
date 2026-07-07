@@ -6,13 +6,22 @@ from unittest.mock import AsyncMock, patch
 @pytest.fixture(scope="module")
 def client():
     from backend.main import app
+    from backend.core.config import settings
     with TestClient(app) as c:
+        # Startup (lifespan) generates settings.api_auth_token if unset — every
+        # /api route now requires it as X-API-Key.
+        c.headers.update({"X-API-Key": settings.api_auth_token})
         yield c
 
 
 def test_docs_endpoint(client):
     resp = client.get("/api/docs")
     assert resp.status_code == 200
+
+
+def test_bot_status_requires_api_key(client):
+    resp = client.get("/api/bot/status", headers={"X-API-Key": "wrong"})
+    assert resp.status_code == 401
 
 
 def test_bot_status(client):

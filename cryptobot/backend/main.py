@@ -5,9 +5,10 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.core.auth import check_ws_api_key, ensure_api_auth_token, require_api_key
 from backend.core.config import settings
 from backend.core.state import bot_state
 from backend.core.websocket import ws_manager
@@ -115,6 +116,19 @@ async def lifespan(app: FastAPI):
 
     _bot_start_time = asyncio.get_event_loop().time()
 
+    token, was_generated = ensure_api_auth_token()
+    if was_generated:
+        logger.warning(
+            "=" * 70 + "\n"
+            "No API_AUTH_TOKEN set — generated a random one for this run:\n"
+            f"  {token}\n"
+            "This token is required as header 'X-API-Key' (REST) or '?api_key='\n"
+            "(WebSocket) on every /api and /ws request. It will CHANGE on next\n"
+            "restart unless you set API_AUTH_TOKEN in .env.\n" + "=" * 70
+        )
+    else:
+        logger.info("API auth token loaded from configuration.")
+
     async with AsyncSessionLocal() as _db:
         from backend.api.routes_config import _apply_to_settings
         saved = await crud.get_config(_db)
@@ -178,18 +192,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routers under /api prefix
-app.include_router(routes_trades.router, prefix="/api")
-app.include_router(routes_stats.router, prefix="/api")
-app.include_router(routes_bot.router, prefix="/api")
-app.include_router(routes_candles.router, prefix="/api")
-app.include_router(routes_backtest.router, prefix="/api")
-app.include_router(routes_config.router, prefix="/api")
-app.include_router(routes_paper.router, prefix="/api")
-app.include_router(routes_scanner.router, prefix="/api")
+# Register routers under /api prefix — all require the X-API-Key header
+# (bot start/stop and config include real-money control + exchange credentials).
+_auth = [Depends(require_api_key)]
+app.include_router(routes_trades.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_stats.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_bot.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_candles.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_backtest.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_config.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_paper.router, prefix="/api", dependencies=_auth)
+app.include_router(routes_scanner.router, prefix="/api", dependencies=_auth)
 
 
-@app.get("/api/logs")
+@app.get("/api/logs", dependencies=_auth)
 async def get_logs(limit: int = 200, level: str = None):
     async with AsyncSessionLocal() as db:
         logs = await crud.get_recent_logs(db, limit=limit, level=level)
@@ -246,6 +262,9 @@ async def system_health():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    if not check_ws_api_key(websocket):
+        await websocket.close(code=4401)
+        return
     await ws_manager.connect(websocket)
     # Send initial state on connect
     await ws_manager.send_personal(websocket, {"type": "bot_state", "data": bot_state.to_dict()})

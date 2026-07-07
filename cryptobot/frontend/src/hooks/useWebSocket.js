@@ -1,7 +1,14 @@
 import { useEffect, useRef } from 'react'
 import useStore from '../store/useStore.js'
+import { getApiKey } from '../lib/apiKey.js'
 
-const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+// If the frontend and backend are on different origins in production, set
+// VITE_WS_BASE_URL to the backend's WebSocket URL, e.g. wss://bot.example.com/ws
+function wsUrl() {
+  const configured = import.meta.env.VITE_WS_BASE_URL
+  const base = configured || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+  return `${base}?api_key=${encodeURIComponent(getApiKey())}`
+}
 
 export function useWebSocket() {
   const wsRef = useRef(null)
@@ -19,7 +26,7 @@ export function useWebSocket() {
     function connect() {
       if (wsRef.current?.readyState === WebSocket.OPEN) return
 
-      const ws = new WebSocket(WS_URL)
+      const ws = new WebSocket(wsUrl())
       wsRef.current = ws
 
       ws.onopen = () => {

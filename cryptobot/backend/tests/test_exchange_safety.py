@@ -48,8 +48,8 @@ def test_check_order_filled_rechecks_when_cancel_fails():
     })
     mock.cancel_order = AsyncMock(side_effect=Exception("order already filled"))
 
-    price = asyncio.run(ex.check_order_filled("ETH/USDT", "ord-1", timeout=0))
-    assert price == pytest.approx(1501.5)
+    result = asyncio.run(ex.check_order_filled("ETH/USDT", "ord-1", timeout=0))
+    assert result == (pytest.approx(1501.5), pytest.approx(1))
 
 
 def test_check_order_filled_returns_none_when_cancelled_clean():
@@ -57,5 +57,19 @@ def test_check_order_filled_returns_none_when_cancelled_clean():
     mock.fetch_order = AsyncMock(return_value={"status": "open", "filled": 0, "amount": 1})
     mock.cancel_order = AsyncMock(return_value=True)
 
-    price = asyncio.run(ex.check_order_filled("ETH/USDT", "ord-2", timeout=0))
-    assert price is None
+    result = asyncio.run(ex.check_order_filled("ETH/USDT", "ord-2", timeout=0))
+    assert result is None
+
+
+def test_check_order_filled_reports_partial_fill_after_cancel():
+    """A timeout cancel only cancels the unfilled remainder — if part of the
+    order already filled, that partial position must be reported back (not
+    swallowed as 'no fill'), so the caller can track and protect it."""
+    ex, mock = _make_exchange()
+    mock.fetch_order = AsyncMock(return_value={
+        "status": "open", "filled": 0.4, "amount": 1, "average": 1502.0, "price": 1502.0,
+    })
+    mock.cancel_order = AsyncMock(return_value=True)
+
+    result = asyncio.run(ex.check_order_filled("ETH/USDT", "ord-3", timeout=0))
+    assert result == (pytest.approx(1502.0), pytest.approx(0.4))

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 import ccxt.async_support as ccxt
 import pandas as pd
 
@@ -156,34 +156,44 @@ class BybitExchange:
             logger.error(f"Cancel order error: {e}")
             return False
 
-    async def check_order_filled(self, symbol: str, order_id: str, timeout: int = 120) -> Optional[float]:
+    async def check_order_filled(
+        self, symbol: str, order_id: str, timeout: int = 120
+    ) -> Optional[Tuple[float, float]]:
         """
-        Poll order status up to `timeout` seconds. Return filled_price if filled.
-        On timeout, cancel the order — but if the cancel fails, re-check status once
-        in case it filled in the meantime (avoids abandoning a live/filled order).
+        Poll order status up to `timeout` seconds. Returns (avg_fill_price, filled_qty)
+        for ANY nonzero fill. Bybit only cancels the unfilled remainder of an order,
+        so a partial fill before timeout leaves a real position behind — that must be
+        reported back (not treated as "no fill") so the caller can track/protect it.
+        Returns None only when nothing filled at all.
         """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
             try:
                 order = await self.get_order(symbol, order_id)
-                if order.get("status") == "closed" or order.get("filled", 0) >= order.get("amount", 1):
+                filled = float(order.get("filled") or 0)
+                if order.get("status") == "closed" or filled >= order.get("amount", 1):
                     filled_price = order.get("average") or order.get("price")
-                    return float(filled_price)
+                    return (float(filled_price), filled)
                 await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"Error polling order {order_id}: {e}")
                 await asyncio.sleep(2)
 
         cancelled = await self.cancel_order(symbol, order_id)
+        final = await self.get_order_status(symbol, order_id)
+        filled_qty = float((final or {}).get("filled") or 0)
+        if filled_qty > 0:
+            fp = (final or {}).get("average") or (final or {}).get("price")
+            if fp:
+                logger.warning(
+                    f"Order {order_id} partially filled ({filled_qty}) "
+                    f"{'before cancel' if cancelled else '— cancel also failed'} — "
+                    f"tracking the filled portion as an open position"
+                )
+                return (float(fp), filled_qty)
         if not cancelled:
-            # Cancel failed — the order may have filled. Check once before giving up.
-            final = await self.get_order_status(symbol, order_id)
-            if final and (final.get("status") == "closed" or final.get("filled", 0) >= final.get("amount", 1)):
-                fp = final.get("average") or final.get("price")
-                logger.warning(f"Order {order_id} filled during cancel attempt @ {fp}")
-                return float(fp) if fp else None
-            logger.error(f"Order {order_id} could not be cancelled and is not confirmed filled — manual check advised")
+            logger.error(f"Order {order_id} could not be cancelled and shows no confirmed fill — manual check advised")
         else:
             logger.warning(f"Order {order_id} not filled after {timeout}s — cancelled")
         return None

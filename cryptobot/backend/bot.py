@@ -178,7 +178,10 @@ async def scan_all_symbols(
 # Crash recovery
 # ------------------------------------------------------------------ #
 
-async def recover_open_trade(state: BotState, db: AsyncSession, notifier: TelegramNotifier):
+async def recover_open_trade(
+    state: BotState, db: AsyncSession, notifier: TelegramNotifier,
+    exchange: MexcExchange = None, config: Settings = None,
+):
     """Restore bot state from DB if a trade was open when bot last stopped."""
     open_trade = await crud.get_open_trade(db)
     if open_trade is None:
@@ -193,7 +196,10 @@ async def recover_open_trade(state: BotState, db: AsyncSession, notifier: Telegr
         state.entry_time = open_trade.entry_time.timestamp()
         state.entry_order_id = open_trade.entry_order_id
         state.peak_price = open_trade.peak_price or open_trade.entry_price
-        state.sl_price = open_trade.hard_sl_price
+        state.sl_price = (
+            open_trade.breakeven_sl if (open_trade.half_exited and open_trade.breakeven_sl)
+            else open_trade.hard_sl_price
+        )
         state.tp1_price = open_trade.take_profit_price
         state.tp2_price = open_trade.tp2_price
         state.atr_1h = open_trade.entry_1h_atr
@@ -221,6 +227,35 @@ async def recover_open_trade(state: BotState, db: AsyncSession, notifier: Telegr
     await notifier.send_error(
         f"Bot restarted with open trade #{open_trade.id} ({open_trade.symbol}) — monitoring resumed."
     )
+
+    # Re-arm the exchange-side stop if it's missing or no longer live. This closes
+    # the gap where a crash right after a failed stop placement (or a stop that
+    # got cancelled/filled while the bot was down) would otherwise resume monitoring
+    # with zero exchange-side protection.
+    if exchange is not None and config is not None and not state.dry_run:
+        needs_rearm = state.sl_order_id is None
+        if state.sl_order_id:
+            order = await exchange.get_order_status(open_trade.symbol, state.sl_order_id)
+            if order is not None:
+                if order.get("status") in ("closed", "canceled", "cancelled", "expired"):
+                    logger.warning(
+                        f"[RECOVERY] Resting stop {state.sl_order_id} for {open_trade.symbol} "
+                        f"is no longer live (status={order.get('status')}) — re-arming"
+                    )
+                    with state._lock:
+                        state.sl_order_id = None
+                    needs_rearm = True
+            else:
+                logger.error(
+                    f"[RECOVERY] Could not verify resting stop {state.sl_order_id} for "
+                    f"{open_trade.symbol} on the exchange — leaving as-is, check manually"
+                )
+        if needs_rearm:
+            rearm_qty = state.qty_remaining or state.qty_total
+            await _place_exchange_stop(
+                state, exchange, db, notifier, config,
+                open_trade.symbol, rearm_qty, state.sl_price, open_trade.id,
+            )
 
 
 # ------------------------------------------------------------------ #
@@ -498,7 +533,7 @@ async def bot_loop(
     logger.info(f"[STARTUP] Trade size: ${config.trade_usdt} | TP1 at 50%% | TP2 at 5:1 R | Max hold: {config.max_hold_hours}h")
 
     await notifier.send_bot_started(config)
-    await recover_open_trade(state, db, notifier)
+    await recover_open_trade(state, db, notifier, exchange, config)
 
     # Fetch min order amounts per symbol
     min_amounts: dict[str, float] = {}
@@ -627,6 +662,7 @@ async def bot_loop(
 
                 # Place order
                 filled_price = None
+                filled_qty = 0.0
                 order_id = ""
 
                 if dry_run:
@@ -634,6 +670,7 @@ async def bot_loop(
                         order = paper_trader.simulate_limit_buy(best_sym, qty, ask_price)
                         order_id = order["id"]
                         filled_price = ask_price
+                        filled_qty = qty
                         logger.info(f"[PAPER] Buy {qty:.6f} {best_sym} @ {ask_price:.4f}")
                     except ValueError as e:
                         logger.warning(f"[PAPER] Cannot open trade: {e}")
@@ -644,20 +681,32 @@ async def bot_loop(
                         order = await exchange.place_limit_buy(best_sym, qty, ask_price)
                         order_id = order["id"]
                         await crud.save_log(db, "ORDER", f"Limit buy placed: {order}")
-                        filled_price = await exchange.check_order_filled(
+                        fill_result = await exchange.check_order_filled(
                             best_sym, order_id,
                             timeout=config.entry_order_timeout_seconds,
                         )
+                        if fill_result:
+                            filled_price, filled_qty = fill_result
                     except Exception as e:
                         logger.error(f"Order error ({best_sym}): {e}")
                         await notifier.send_error(f"Order failed ({best_sym}): {e}")
                         await asyncio.sleep(MONITOR_INTERVAL)
                         continue
 
-                if filled_price is None:
+                if filled_price is None or filled_qty <= 0:
                     logger.warning(f"Order not filled for {best_sym}")
                     await asyncio.sleep(MONITOR_INTERVAL)
                     continue
+
+                if filled_qty < qty:
+                    logger.warning(
+                        f"[PARTIAL FILL] {best_sym} filled {filled_qty:.8f}/{qty:.8f} requested — "
+                        f"tracking the filled amount as the real position"
+                    )
+                    await notifier.send_error(
+                        f"{best_sym} entry only partially filled ({filled_qty:.8f}/{qty:.8f}). "
+                        f"Tracking and protecting the filled amount."
+                    )
 
                 # Post-fill R:R guard — the real fill may differ from the planned
                 # entry (slippage on the marketable limit). Re-check R:R against the
@@ -674,14 +723,14 @@ async def bot_loop(
                     )
                     try:
                         if dry_run:
-                            paper_trader.simulate_market_sell(best_sym, qty, filled_price)
+                            paper_trader.simulate_market_sell(best_sym, filled_qty, filled_price)
                             # paper buy only deducted the entry fee (no principal moved),
                             # so account just the exit fee here to avoid inflating balance.
-                            paper_trader.balance -= qty * filled_price * config.taker_fee_rate
+                            paper_trader.balance -= filled_qty * filled_price * config.taker_fee_rate
                             with state._lock:
                                 state.usdt_balance = paper_trader.balance
                         else:
-                            await exchange.place_market_sell(best_sym, qty)
+                            await exchange.place_market_sell(best_sym, filled_qty)
                     except Exception as e:
                         logger.error(f"[ABORT] Failed to flatten {best_sym} after R:R abort: {e}")
                         await notifier.send_error(
@@ -713,7 +762,7 @@ async def bot_loop(
                     "symbol": best_sym,
                     "entry_time": datetime.utcnow(),
                     "entry_price": filled_price,
-                    "qty": qty,
+                    "qty": filled_qty,
                     "trade_usdt": trade_size,
                     "take_profit_price": tp1_price,
                     "tp2_price": tp2_price,
@@ -734,7 +783,7 @@ async def bot_loop(
 
                 if dry_run:
                     paper_trader.open_trade(
-                        symbol=best_sym, qty=qty, entry_price=filled_price,
+                        symbol=best_sym, qty=filled_qty, entry_price=filled_price,
                         trade_usdt=trade_size,
                         take_profit_price=tp1_price,
                         hard_sl_price=sl_price,
@@ -757,8 +806,8 @@ async def bot_loop(
                     state.atr_1h = atr_1h
                     state.rr_ratio = rr_ratio
                     state.grade = grade
-                    state.qty_total = qty
-                    state.qty_remaining = qty
+                    state.qty_total = filled_qty
+                    state.qty_remaining = filled_qty
                     state.half_exited = False
                     state.tp1_exit_price = None
                     state.tp1_pnl_usdt = None
@@ -779,7 +828,7 @@ async def bot_loop(
                 # stops, sleeps, or crashes. (best-effort; in-process stop still runs)
                 await _place_exchange_stop(
                     state, exchange, db, notifier, config,
-                    best_sym, qty, sl_price, trade_record.id,
+                    best_sym, filled_qty, sl_price, trade_record.id,
                 )
 
             # -------------------------------------------------------- #

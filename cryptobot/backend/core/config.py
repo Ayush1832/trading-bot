@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     telegram_bot_commands: bool = False
 
     # ------------------------------------------------------------------ #
+    # API auth — required header (X-API-Key) / WS query param (api_key) for
+    # every control/data endpoint. If left blank, one is generated at startup
+    # (see main.py) so the control API is never exposed by omission.
+    # ------------------------------------------------------------------ #
+    api_auth_token: str = ""
+
+    # ------------------------------------------------------------------ #
     # API server
     # ------------------------------------------------------------------ #
     api_host: str = "0.0.0.0"
