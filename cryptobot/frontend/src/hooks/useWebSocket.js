@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import useStore from '../store/useStore.js'
 import { getApiKey } from '../lib/apiKey.js'
+import api from './useApi.js'
 
 // If the frontend and backend are on different origins in production, set
 // VITE_WS_BASE_URL to the backend's WebSocket URL, e.g. wss://bot.example.com/ws
@@ -23,6 +24,11 @@ export function useWebSocket() {
   const setWsConnected = useStore((s) => s.setWsConnected)
 
   useEffect(() => {
+    // WS only pushes bot_state/scanner_update from inside the bot's scan
+    // loop, so panels stay empty until the bot is started. Hydrate once via
+    // REST on mount so the dashboard shows current status immediately.
+    api.get('/bot/status').then((r) => setBotState(r.data)).catch(() => {})
+
     function connect() {
       if (wsRef.current?.readyState === WebSocket.OPEN) return
 
