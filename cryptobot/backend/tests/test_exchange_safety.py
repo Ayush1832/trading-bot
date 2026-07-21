@@ -6,12 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.exchange import BybitExchange
+from backend.exchange import MexcExchange
 
 
 def _make_exchange():
-    """BybitExchange with its ccxt client swapped for a controllable mock."""
-    ex = BybitExchange(api_key="", api_secret="", sandbox=False)
+    """MexcExchange with its ccxt client swapped for a controllable mock."""
+    ex = MexcExchange(api_key="", api_secret="", sandbox=False)
     mock = MagicMock()
     # precision helpers are sync in ccxt
     mock.amount_to_precision = lambda symbol, qty: str(qty)
@@ -20,21 +20,18 @@ def _make_exchange():
     return ex, mock
 
 
-def test_place_stop_loss_builds_falling_trigger():
+def test_place_stop_loss_raises_not_implemented_on_mexc_spot():
+    # MEXC spot has no exchange-side conditional/trigger orders (only its
+    # derivatives markets do) — place_stop_loss must fail loudly so the
+    # caller's best-effort wrapper (_place_exchange_stop) falls back to the
+    # in-process trailing stop instead of silently doing nothing.
     ex, mock = _make_exchange()
     mock.create_order = AsyncMock(return_value={"id": "sl-123"})
 
-    order = asyncio.run(ex.place_stop_loss("ETH/USDT", 0.01, 1500.0))
+    with pytest.raises(NotImplementedError):
+        asyncio.run(ex.place_stop_loss("ETH/USDT", 0.01, 1500.0))
 
-    assert order["id"] == "sl-123"
-    args, kwargs = mock.create_order.call_args
-    # create_order(symbol, 'market', 'sell', qty, None, params)
-    assert args[0] == "ETH/USDT"
-    assert args[1] == "market"
-    assert args[2] == "sell"
-    params = args[5] if len(args) > 5 else kwargs.get("params")
-    assert params["triggerDirection"] == 2          # 2 = trigger when price FALLS
-    assert float(params["triggerPrice"]) == 1500.0
+    mock.create_order.assert_not_called()
 
 
 def test_check_order_filled_rechecks_when_cancel_fails():

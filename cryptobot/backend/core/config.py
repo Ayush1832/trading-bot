@@ -4,12 +4,14 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Exchange — Bybit
+    # Exchange — MEXC. Field names kept as bybit_* for backward compat with
+    # existing .env/DB-persisted keys; set either bybit_api_key/secret or
+    # mexc_api_key/secret to your real MEXC API key/secret (see main.py,
+    # which reads whichever pair is non-empty).
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
     sandbox_mode: bool = False
 
-    # Legacy aliases so existing DB-persisted config keys keep working
     mexc_api_key: str = ""
     mexc_api_secret: str = ""
 
@@ -36,7 +38,9 @@ class Settings(BaseSettings):
     trade_usdt: float = 1.0         # hard cap enforced in bot.py at $1.00
     max_trade_usdt: float = 1.0    # explicit hard cap (same value)
 
-    # Bybit spot TAKER fee — 0.1%. Used for sizing (so cost stays under balance)
+    # MEXC spot TAKER fee — 0.1% (conservative; MEXC's public rate is ~0.05%,
+    # this errs high so sizing never underestimates the fee). Used for sizing
+    # (so cost stays under balance)
     # and for P&L accounting. Was previously hard-coded at 0.0005 (wrong → optimistic P&L).
     taker_fee_rate: float = 0.001
 

@@ -537,11 +537,14 @@ async def bot_loop(
 
     # Fetch min order amounts per symbol
     min_amounts: dict[str, float] = {}
+    min_costs: dict[str, float] = {}
     for sym in config.symbols:
         if exchange.exchange.apiKey:
             min_amounts[sym] = await exchange.get_min_order_amount(sym)
+            min_costs[sym] = await exchange.get_min_order_cost(sym)
         else:
             min_amounts[sym] = 0.0
+            min_costs[sym] = 0.0
 
     # Starting balance
     try:
@@ -654,7 +657,21 @@ async def bot_loop(
                 # SAFETY: hard cap at $1.00
                 trade_size = min(config.trade_usdt, 1.0)
                 min_amt = min_amounts.get(best_sym, 0.0)
-                qty = calculate_position_qty(trade_size, ask_price, min_amt, config.taker_fee_rate)
+                min_cost = min_costs.get(best_sym, 0.0)
+                if min_cost and trade_size < min_cost:
+                    logger.warning(
+                        f"Trade size ${trade_size:.2f} below {best_sym} exchange minimum "
+                        f"notional ${min_cost:.2f} — skipping entry"
+                    )
+                    await asyncio.sleep(MONITOR_INTERVAL)
+                    continue
+                # Exchange enforces a minimum notional (quote/USDT), not just a
+                # minimum base quantity — convert it to an effective min qty at
+                # the current ask so calculate_position_qty rejects too-small fills.
+                min_qty_for_cost = (min_cost / ask_price) if min_cost else 0.0
+                qty = calculate_position_qty(
+                    trade_size, ask_price, max(min_amt, min_qty_for_cost), config.taker_fee_rate
+                )
                 if qty <= 0:
                     logger.warning(f"Qty too small for {best_sym} @ {ask_price}")
                     await asyncio.sleep(MONITOR_INTERVAL)
